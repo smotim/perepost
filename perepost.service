@@ -1,0 +1,24 @@
+# Running without Docker: the binary in /usr/local/bin/perepost, variables in
+# /etc/perepost/env (same format as .env), routes in /etc/perepost/config.yaml.
+#   sudo cp perepost.service /etc/systemd/system/ && sudo systemctl enable --now perepost
+[Unit]
+Description=perepost: Telegram channel posts to MAX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/perepost
+EnvironmentFile=/etc/perepost/env
+Environment=CONFIG_FILE=/etc/perepost/config.yaml
+Restart=always
+RestartSec=10
+# On shutdown the bot delivers posts it already received — up to 50 seconds
+TimeoutStopSec=60
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

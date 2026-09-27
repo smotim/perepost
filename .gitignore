@@ -1,0 +1,5 @@
+.env
+config.yaml
+/config/
+/perepost
+/dist/

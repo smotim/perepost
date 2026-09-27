@@ -1,0 +1,15 @@
+services:
+  perepost:
+    image: ghcr.io/smotim/perepost:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Routes for several channels: ./config/config.yaml (see config.example.yaml)
+      - ./config:/etc/perepost:ro
+    # On shutdown the bot delivers posts it already received — up to 50 seconds
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

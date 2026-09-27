@@ -1,0 +1,19 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - noctx
+    - unconvert
+    - usestdlibvars
+  exclusions:
+    presets:
+      # Unchecked fmt.Fprint*, Close and the like — the usual Go idiom
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
