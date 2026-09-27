@@ -52,12 +52,16 @@ The documentation below is in Russian, since MAX is a Russian messenger.
 2. **Бот MAX.** Создайте бота по [документации MAX](https://dev.max.ru/) и добавьте его
    администратором каждого канала-получателя с правом публикации. Подойдёт и существующий бот:
    perepost только отправляет сообщения и не трогает его вебхук.
-3. **Доступ к MAX.** Сервер должен достукиваться и до `api.telegram.org`, и до API MAX.
-   Проверить MAX с сервера:
+3. **Доступ к MAX.** Сервер должен достукиваться и до `api.telegram.org`, и до API MAX. API MAX
+   подписан сертификатом Минцифры, которого нет в стандартных наборах, поэтому `curl` нужен
+   корневой сертификат из репозитория (бот носит его с собой, ставить в систему ничего не нужно):
 
    ```bash
-   curl -H "Authorization: <токен MAX>" https://platform-api2.max.ru/me
+   curl --cacert <(curl -fsSL https://raw.githubusercontent.com/smotim/perepost/main/certs/russian_trusted_root_ca.pem) \
+     -H "Authorization: <токен MAX>" https://platform-api2.max.ru/me
    ```
+
+   В ответ должен прийти JSON с данными бота.
 
 ## Запуск в Docker
 
@@ -149,6 +153,9 @@ journalctl -u perepost -f
   отправляет альбом целиком.
 - Файл скачивается из Telegram один раз и загружается в каждый канал MAX. Сетевые сбои, ответы 429 и
   5xx повторяются с нарастающей паузой.
+- API MAX (`platform-api2.max.ru`) с июля 2026 подписан сертификатом НУЦ Минцифры «Russian Trusted
+  Root CA». Он встроен в бота ([`certs/`](certs), SHA-256 `D2:6D:2D:02:…:CA:8E:CF:31`), и доверяет
+  ему бот только в запросах к MAX; Telegram проверяется стандартным набором сертификатов.
 - Пока бот не работал, Telegram хранит посты сутки: после перезапуска они будут пересланы.
 - При остановке бот досылает уже полученные посты (до 50 секунд).
 

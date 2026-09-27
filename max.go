@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,11 +38,40 @@ type maxClient struct {
 	token string
 }
 
+// russianRootCA is the Russian Trusted Root CA of the Ministry of Digital
+// Development (SHA-256 D2:6D:2D:02:…:CA:8E:CF:31, valid until 2032). Since
+// July 2026 the MAX API at platform-api2.max.ru presents a certificate issued
+// under it, and no standard trust store includes it.
+//
+//go:embed certs/russian_trusted_root_ca.pem
+var russianRootCA []byte
+
+// maxTransport trusts the system roots plus the Russian root. Only MAX
+// requests use it: Telegram and everything else keep the system roots alone.
+func maxTransport() (*http.Transport, error) {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		roots = x509.NewCertPool()
+	}
+	if !roots.AppendCertsFromPEM(russianRootCA) {
+		return nil, errors.New("не удалось прочитать встроенный корневой сертификат Минцифры")
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+
+	return transport, nil
+}
+
 func newMaxClient(token string) (*maxClient, error) {
+	transport, err := maxTransport()
+	if err != nil {
+		return nil, err
+	}
 	client := &http.Client{
 		// The library default of 30 s is not always enough to upload a video
 		Timeout:   10 * time.Minute,
-		Transport: retryableStatus{next: http.DefaultTransport},
+		Transport: retryableStatus{next: transport},
 	}
 	api, err := maxbot.NewApi(token, maxbot.WithHTTPClient(client))
 	if err != nil {
