@@ -26,6 +26,12 @@ type attachment struct {
 	token string
 }
 
+func isNumber(s string) bool {
+	_, err := strconv.ParseInt(s, 10, 64)
+
+	return err == nil
+}
+
 // maxChat is a MAX channel the bot posts to.
 type maxChat struct {
 	id    int64
@@ -69,8 +75,8 @@ func newMaxClient(token string) (*maxClient, error) {
 		return nil, err
 	}
 	client := &http.Client{
-		// The library default of 30 s is not always enough to upload a video
-		Timeout:   10 * time.Minute,
+		// The library default of 30 s is far too short for a video of up to 2 GB
+		Timeout:   30 * time.Minute,
 		Transport: retryableStatus{next: transport},
 	}
 	api, err := maxbot.NewApi(token, maxbot.WithHTTPClient(client))
@@ -111,8 +117,14 @@ func (m *maxClient) resolve(ctx context.Context, ref string) (maxChat, error) {
 		err = m.get(ctx, "/chats/"+url.PathEscape(channelName(ref, "max.ru")), &chat)
 	}
 	if err != nil {
-		return maxChat{}, fmt.Errorf("канал MAX %q не найден: %w. Бот должен быть администратором канала; сейчас он состоит в: %s",
-			ref, err, m.knownChannels(ctx))
+		hint := "по ссылке MAX находит не все каналы — надёжнее числовой id: он в адресной строке, если открыть канал на web.max.ru"
+		if strings.HasPrefix(ref, "-") || !isNumber(ref) {
+			hint += "; и проверьте, что бот — администратор канала"
+		} else {
+			hint = "у каналов MAX id отрицательный — попробуйте -" + ref
+		}
+
+		return maxChat{}, fmt.Errorf("канал MAX %q не найден (%w): %s", ref, err, hint)
 	}
 
 	c := maxChat{id: chat.ChatID, title: chat.Title}
@@ -131,28 +143,6 @@ func (m *maxClient) checkAdmin(ctx context.Context, chat maxChat) error {
 	}
 
 	return nil
-}
-
-// knownChannels lists the channels the bot is a member of — a setup hint.
-func (m *maxClient) knownChannels(ctx context.Context) string {
-	var list struct {
-		Chats []model.Chat `json:"chats"`
-	}
-	if err := m.get(ctx, "/chats?count=100", &list); err != nil {
-		return "не удалось получить список (" + err.Error() + ")"
-	}
-
-	var channels []string
-	for _, c := range list.Chats {
-		if c.Type == model.ChatTypeChannel {
-			channels = append(channels, fmt.Sprintf("«%s» (id %d)", c.Title, c.ChatID))
-		}
-	}
-	if len(channels) == 0 {
-		return "ни одного канала"
-	}
-
-	return strings.Join(channels, ", ")
 }
 
 // get calls the MAX API endpoints the client library lacks.
@@ -178,8 +168,14 @@ func (m *maxClient) get(ctx context.Context, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func (m *maxClient) upload(ctx context.Context, kind model.UploadType, name string, data []byte) (string, error) {
-	return m.api.Upload.Upload(ctx, kind, bytes.NewReader(data), name, int64(len(data)))
+func (m *maxClient) upload(ctx context.Context, kind model.UploadType, name string, file tgFile) (string, error) {
+	r, err := file.open()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = r.Close() }()
+
+	return m.api.Upload.Upload(ctx, kind, r, name, file.size)
 }
 
 func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, notify, preview bool) error {

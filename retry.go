@@ -36,6 +36,6 @@ func permanent(err error) bool {
 		return !maxErr.IsAttachmentNotReady()
 	}
 
-	return errors.Is(err, errTooBig) || errors.Is(err, bot.ErrorBadRequest) || errors.Is(err, bot.ErrorForbidden) ||
+	return errors.Is(err, errTooBig) || errors.Is(err, errNotOnVolume) || errors.Is(err, bot.ErrorBadRequest) || errors.Is(err, bot.ErrorForbidden) ||
 		errors.Is(err, bot.ErrorUnauthorized) || errors.Is(err, bot.ErrorNotFound)
 }

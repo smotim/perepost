@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -14,10 +19,50 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-// tgDownloadLimit is the largest file the Bot API lets a bot download.
+// tgDownloadLimit is the largest file the cloud Bot API lets a bot download.
+// A local Bot API server (TELEGRAM_API_URL, --local mode) has no such limit.
 const tgDownloadLimit = 20 << 20
 
-var errTooBig = errors.New("файл больше 20 МБ: Bot API такие не отдаёт")
+// errNotOnVolume means the local server's file is not where it said: the
+// volume is not shared with perepost. Retrying will not help.
+var errNotOnVolume = errors.New("файл от сервера Bot API не найден на общем томе — у perepost и telegram-bot-api должен быть один том по одному пути")
+
+var errTooBig = errors.New("файл больше 20 МБ: облачный Bot API такие не отдаёт — поможет свой сервер Bot API (TELEGRAM_API_URL, см. README)")
+
+// tgFile is a downloaded Telegram file: in memory from the cloud Bot API, or
+// on a volume shared with a local Bot API server, which answers getFile with
+// an absolute path instead of a download link. The path contains the bot
+// token, so it never goes into errors or logs.
+type tgFile struct {
+	data []byte
+	path string
+	size int64
+}
+
+// open is called for every upload attempt: a file on disk is streamed, not
+// loaded into memory — a local server hands out files up to 2 GB.
+func (f tgFile) open() (io.ReadCloser, error) {
+	if f.path == "" {
+		return io.NopCloser(bytes.NewReader(f.data)), nil
+	}
+	file, err := os.Open(f.path)
+	if err != nil {
+		return nil, fmt.Errorf("чтение скачанного файла: %w", withoutPath(err))
+	}
+
+	return file, nil
+}
+
+// remove deletes a file the local server downloaded, so the volume does not
+// fill up with videos. Telegram downloads it again if it is ever requested.
+func (f tgFile) remove() {
+	if f.path == "" {
+		return
+	}
+	if err := os.Remove(f.path); err != nil {
+		slog.Warn("не удалось удалить скачанный файл", "err", withoutPath(err))
+	}
+}
 
 // checkWebhook refuses a bot that has a webhook: Telegram does not hand its
 // updates to getUpdates, and deleting the webhook would break whoever set it.
@@ -72,41 +117,60 @@ func checkTelegramAdmin(ctx context.Context, tg *bot.Bot, chat *models.ChatFullI
 	return nil
 }
 
-// downloadFile downloads a whole file: MAX needs its size up front.
-func downloadFile(ctx context.Context, tg *bot.Bot, client *http.Client, fileID string) ([]byte, error) {
+// downloadFile fetches a file: a local Bot API server has already put it on
+// the shared volume, the cloud one is downloaded whole — MAX needs the size up front.
+func downloadFile(ctx context.Context, tg *bot.Bot, client *http.Client, fileID string) (tgFile, error) {
 	file, err := tg.GetFile(ctx, &bot.GetFileParams{FileID: fileID})
 	if err != nil {
-		return nil, err
+		return tgFile{}, err
+	}
+	if filepath.IsAbs(file.FilePath) {
+		info, err := os.Stat(file.FilePath)
+		if err != nil {
+			return tgFile{}, fmt.Errorf("%w (%w)", errNotOnVolume, withoutPath(err))
+		}
+
+		return tgFile{path: file.FilePath, size: info.Size()}, nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tg.FileDownloadLink(file), nil)
 	if err != nil {
-		return nil, errors.New("не удалось собрать запрос на скачивание")
+		return tgFile{}, errors.New("не удалось собрать запрос на скачивание")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("скачивание файла: %w", withoutURL(err)) // the URL contains the bot token
+		return tgFile{}, fmt.Errorf("скачивание файла: %w", withoutURL(err)) // the URL contains the bot token
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("скачивание файла: Telegram ответил %s", resp.Status)
+		return tgFile{}, fmt.Errorf("скачивание файла: Telegram ответил %s", resp.Status)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, tgDownloadLimit+1))
 	if err != nil {
-		return nil, fmt.Errorf("скачивание файла: %w", err)
+		return tgFile{}, fmt.Errorf("скачивание файла: %w", err)
 	}
 	if len(data) > tgDownloadLimit {
-		return nil, errTooBig
+		return tgFile{}, errTooBig
 	}
 
-	return data, nil
+	return tgFile{data: data, size: int64(len(data))}, nil
 }
 
 // withoutURL strips the request URL from an error: it may hold a token or secret.
 func withoutURL(err error) error {
 	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		return urlErr.Err
+	}
+
+	return err
+}
+
+// withoutPath strips the file path from an error: a local server's paths
+// contain the bot token.
+func withoutPath(err error) error {
+	if pathErr, ok := errors.AsType[*fs.PathError](err); ok {
+		return fmt.Errorf("%s: %w", pathErr.Op, pathErr.Err)
 	}
 
 	return err

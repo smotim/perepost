@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -76,7 +80,12 @@ func fakes(t *testing.T) *fake {
 		_ = r.ParseMultipartForm(1 << 20)
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/getFile"):
-			fmt.Fprintf(w, `{"ok":true,"result":{"file_id":%q,"file_path":"files/%s"}}`, r.FormValue("file_id"), r.FormValue("file_id"))
+			// A local Bot API server answers with an absolute path on the shared volume
+			path := "files/" + r.FormValue("file_id")
+			if strings.HasPrefix(r.FormValue("file_id"), "/") {
+				path = r.FormValue("file_id")
+			}
+			fmt.Fprintf(w, `{"ok":true,"result":{"file_id":%q,"file_path":%q}}`, r.FormValue("file_id"), path)
 		case strings.Contains(r.URL.Path, "/file/bot"):
 			fmt.Fprint(w, "bytes of "+r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
 		case strings.HasSuffix(r.URL.Path, "/getChatMember"):
@@ -146,10 +155,11 @@ func fakes(t *testing.T) *fake {
 		t.Fatal(err)
 	}
 	f.relay = &relay{
-		tg:      tg,
-		max:     &maxClient{api: api, http: maxServer.Client(), token: "max-token"},
-		http:    tgServer.Client(),
-		adminID: 777,
+		tg:        tg,
+		max:       &maxClient{api: api, http: maxServer.Client(), token: "max-token"},
+		http:      tgServer.Client(),
+		adminID:   777,
+		fileLimit: tgDownloadLimit,
 	}
 	f.source = &source{
 		channel: &models.ChatFullInfo{ID: -100, Title: "Канал", Username: "channel"},
@@ -281,6 +291,44 @@ func TestTooBigVideoIsLinkedAndReported(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 	if alerts := f.alerted(); len(alerts) != 1 || !strings.Contains(alerts[0], "video.mp4") {
+		t.Fatalf("alerts %q", alerts)
+	}
+}
+
+func TestLocalBotAPIFileIsStreamedFromDiskAndRemoved(t *testing.T) {
+	f := fakes(t)
+	f.relay.fileLimit = 0 // own Bot API server: no 20 MB limit
+	path := filepath.Join(t.TempDir(), "bot-token", "videos", "file_0.mp4")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("video bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f.forward(&models.Message{ID: 12, Caption: "Запись", Video: &models.Video{FileID: path, FileSize: 300 << 20}})
+
+	got := f.messages()
+	if len(got) != 1 || got[0].body.Text != "Запись" || len(got[0].body.Attachments) != 1 || got[0].body.Attachments[0].Type != "video" {
+		t.Fatalf("got %+v", got)
+	}
+	if alerts := f.alerted(); len(alerts) != 0 {
+		t.Fatalf("alerts %q", alerts)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("downloaded file is still on the volume: %v", err)
+	}
+}
+
+func TestMissingLocalFileErrorHidesThePath(t *testing.T) {
+	f := fakes(t)
+	f.relay.fileLimit = 0
+	path := filepath.Join(t.TempDir(), "123:secret-token", "videos", "gone.mp4")
+
+	f.forward(&models.Message{ID: 13, Caption: "Запись", Video: &models.Video{FileID: path}})
+
+	alerts := f.alerted()
+	if len(alerts) != 1 || strings.Contains(alerts[0], "secret-token") || !strings.Contains(alerts[0], "общем томе") {
 		t.Fatalf("alerts %q", alerts)
 	}
 }

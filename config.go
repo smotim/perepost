@@ -22,6 +22,7 @@ type config struct {
 	maxToken      string
 	adminID       int64  // Telegram user to report failures to; 0 — nobody
 	heartbeat     string // URL to POST to after every successful health check
+	telegramAPI   string // own Bot API server (--local mode): files up to 2 GB instead of 20 MB
 	routes        []route
 }
 
@@ -56,7 +57,12 @@ func (r *refs) UnmarshalYAML(node *yaml.Node) error {
 func loadConfig() (config, error) {
 	env := func(key string) string { return strings.TrimSpace(os.Getenv(key)) }
 
-	c := config{telegramToken: env("TELEGRAM_BOT_TOKEN"), maxToken: env("MAX_BOT_TOKEN"), heartbeat: env("HEARTBEAT_URL")}
+	c := config{
+		telegramToken: env("TELEGRAM_BOT_TOKEN"),
+		maxToken:      env("MAX_BOT_TOKEN"),
+		heartbeat:     env("HEARTBEAT_URL"),
+		telegramAPI:   strings.TrimSuffix(env("TELEGRAM_API_URL"), "/"),
+	}
 	var missing []string
 	if c.telegramToken == "" {
 		missing = append(missing, "TELEGRAM_BOT_TOKEN")
@@ -77,6 +83,9 @@ func loadConfig() (config, error) {
 	}
 	if u, err := url.Parse(c.heartbeat); c.heartbeat != "" && (err != nil || (u.Scheme != "https" && u.Scheme != "http")) {
 		return c, errors.New("HEARTBEAT_URL — адрес вида https://…")
+	}
+	if u, err := url.Parse(c.telegramAPI); c.telegramAPI != "" && (err != nil || (u.Scheme != "https" && u.Scheme != "http")) {
+		return c, errors.New("TELEGRAM_API_URL — адрес сервера Bot API вида http://telegram-bot-api:8081")
 	}
 
 	path := env("CONFIG_FILE")

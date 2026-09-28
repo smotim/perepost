@@ -66,7 +66,7 @@ func run() error {
 	defer stop()
 
 	var sources map[int64]*source
-	tg, err := bot.New(cfg.telegramToken,
+	options := []bot.Option{
 		// One synchronous handler: otherwise posts could get reordered
 		bot.WithWorkers(1),
 		bot.WithNotAsyncHandlers(),
@@ -85,7 +85,13 @@ func run() error {
 			}
 			src.posts.add(m)
 		}),
-	)
+	}
+	fileLimit := int64(tgDownloadLimit)
+	if cfg.telegramAPI != "" {
+		options = append(options, bot.WithServerURL(cfg.telegramAPI))
+		fileLimit = 0
+	}
+	tg, err := bot.New(cfg.telegramToken, options...)
 	if err != nil {
 		return fmt.Errorf("не удалось подключиться к Telegram: %w", err)
 	}
@@ -102,7 +108,7 @@ func run() error {
 	}
 	list := slices.SortedFunc(maps.Values(sources), func(a, b *source) int { return cmp.Compare(a.channel.Title, b.channel.Title) })
 
-	r := &relay{tg: tg, max: maxc, http: &http.Client{Timeout: 5 * time.Minute}, adminID: cfg.adminID}
+	r := &relay{tg: tg, max: maxc, http: &http.Client{Timeout: 5 * time.Minute}, adminID: cfg.adminID, fileLimit: fileLimit}
 	// Sending outlives the stop signal: posts already received get delivered
 	sending, abort := context.WithCancel(context.Background())
 	defer abort()

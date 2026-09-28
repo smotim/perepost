@@ -35,10 +35,11 @@ func (s *source) postRef(id int) string {
 
 // relay moves posts of Telegram channels into MAX channels.
 type relay struct {
-	tg      *bot.Bot
-	max     *maxClient
-	http    *http.Client
-	adminID int64 // Telegram user to report failures to; 0 — nobody
+	tg        *bot.Bot
+	max       *maxClient
+	http      *http.Client
+	adminID   int64 // Telegram user to report failures to; 0 — nobody
+	fileLimit int64 // largest file Telegram hands out; 0 — no limit (local Bot API server)
 }
 
 // uploads are the attachments of one post uploaded for one MAX channel.
@@ -100,10 +101,10 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 	}
 
 	// Each file is downloaded once and uploaded for every destination, so only
-	// one file is held in memory at a time.
+	// one file is held at a time.
 	uploaded := make([]uploads, len(src.to))
 	for _, md := range files {
-		data, err := r.download(ctx, md)
+		file, err := r.download(ctx, md)
 		if err != nil {
 			log.Error("вложение не скачано", "file", md.name, "err", err)
 			problems = append(problems, fmt.Sprintf("%s: %v", md.name, err))
@@ -112,7 +113,7 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 			continue
 		}
 		for i, dst := range src.to {
-			a, err := r.upload(ctx, md, data)
+			a, err := r.upload(ctx, md, file)
 			if err != nil {
 				log.Error("вложение не загружено в MAX", "file", md.name, "to", dst.title, "err", err)
 				problems = append(problems, fmt.Sprintf("%s → «%s»: %v", md.name, dst.title, err))
@@ -122,6 +123,7 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 			}
 			uploaded[i].add(a)
 		}
+		file.remove()
 	}
 
 	for i, dst := range src.to {
@@ -186,25 +188,25 @@ func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads
 	return len(messages), nil
 }
 
-func (r *relay) download(ctx context.Context, md media) ([]byte, error) {
-	if md.size > tgDownloadLimit {
-		return nil, errTooBig
+func (r *relay) download(ctx context.Context, md media) (tgFile, error) {
+	if r.fileLimit > 0 && md.size > r.fileLimit {
+		return tgFile{}, errTooBig
 	}
 
-	var data []byte
+	var file tgFile
 	err := retry(ctx, func() (err error) {
-		data, err = downloadFile(ctx, r.tg, r.http, md.fileID)
+		file, err = downloadFile(ctx, r.tg, r.http, md.fileID)
 
 		return err
 	})
 
-	return data, err
+	return file, err
 }
 
-func (r *relay) upload(ctx context.Context, md media, data []byte) (attachment, error) {
+func (r *relay) upload(ctx context.Context, md media, file tgFile) (attachment, error) {
 	var token string
 	err := retry(ctx, func() (err error) {
-		token, err = r.max.upload(ctx, md.upload, md.name, data)
+		token, err = r.max.upload(ctx, md.upload, md.name, file)
 
 		return err
 	})
