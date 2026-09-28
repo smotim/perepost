@@ -6,12 +6,13 @@ import (
 	"log/slog"
 	"time"
 
+	vkapi "github.com/SevereCloud/vksdk/v3/api"
 	"github.com/go-telegram/bot"
 	maxbot "github.com/max-messenger/max-bot-api-client-go/v2"
 )
 
-// retry repeats transient failures — network, 429, 5xx, "attachment not
-// ready" — with a growing pause: 2, 4, 8, 16 seconds.
+// retry repeats transient failures — network, 429, 5xx, MAX "attachment not
+// ready", VK "too many requests" — with a growing pause: 2, 4, 8, 16 seconds.
 func retry(ctx context.Context, fn func() error) error {
 	const attempts = 5
 	delay := 2 * time.Second
@@ -34,6 +35,9 @@ func retry(ctx context.Context, fn func() error) error {
 func permanent(err error) bool {
 	if maxErr, ok := errors.AsType[*maxbot.Error](err); ok {
 		return !maxErr.IsAttachmentNotReady()
+	}
+	if vkErr, ok := errors.AsType[*vkapi.Error](err); ok {
+		return vkErr.Code != vkapi.ErrTooMany && vkErr.Code != vkapi.ErrServer
 	}
 
 	return errors.Is(err, errTooBig) || errors.Is(err, errNotOnVolume) || errors.Is(err, bot.ErrorBadRequest) || errors.Is(err, bot.ErrorForbidden) ||

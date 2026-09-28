@@ -1,4 +1,5 @@
 # Маршруты: каждый пост любого канала из from уходит во все каналы из to.
+# В to — каналы MAX и сообщества VK вперемешку: https://vk.com/name или vk:name.
 # Канал — ссылка, @имя или числовой id (для закрытых каналов). В from и to
 # можно указать один канал или список. Токены сюда не пишутся — они в .env.
 routes:
@@ -13,3 +14,4 @@ routes:
     to:
       - https://max.ru/my_news
       - https://max.ru/my_digest
+      - https://vk.com/my_community

@@ -25,7 +25,7 @@ const (
 type monitor struct {
 	relay     *relay
 	sources   []*source
-	to        []maxChat // every destination once
+	to        []destination // every destination once
 	heartbeat string
 	client    *http.Client
 	failing   bool
@@ -48,7 +48,7 @@ func (m *monitor) check(ctx context.Context) {
 		checks = append(checks, func(ctx context.Context) error { return checkTelegramAdmin(ctx, m.relay.tg, src.channel) })
 	}
 	for _, dst := range m.to {
-		checks = append(checks, func(ctx context.Context) error { return m.relay.max.checkAdmin(ctx, dst) })
+		checks = append(checks, dst.checkAdmin)
 	}
 	problems := runChecks(ctx, checks, checkParallelism, checkTimeout)
 	if ctx.Err() != nil {

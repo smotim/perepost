@@ -19,11 +19,11 @@ func writeConfig(t *testing.T, yaml string) string {
 }
 
 func TestSinglePairFromEnvironment(t *testing.T) {
-	routes, err := loadRoutes(filepath.Join(t.TempDir(), "missing.yaml"), "@news", "https://max.ru/news")
+	routes, err := loadRoutes(filepath.Join(t.TempDir(), "missing.yaml"), "@news", refs{"https://max.ru/news", "vk:news"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 1 || !slices.Equal(routes[0].From, refs{"@news"}) || !slices.Equal(routes[0].To, refs{"https://max.ru/news"}) {
+	if len(routes) != 1 || !slices.Equal(routes[0].From, refs{"@news"}) || !slices.Equal(routes[0].To, refs{"https://max.ru/news", "vk:news"}) {
 		t.Fatalf("routes %+v", routes)
 	}
 }
@@ -38,7 +38,7 @@ routes:
       - https://max.ru/y
       - -71234567
 `)
-	routes, err := loadRoutes(path, "", "")
+	routes, err := loadRoutes(path, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,13 +51,13 @@ routes:
 
 func TestConfigMistakesAreReported(t *testing.T) {
 	cases := map[string]struct {
-		yaml, telegram, max, want string
+		yaml, telegram, target, want string
 	}{
 		"typo in a key":   {yaml: "routes:\n  - form: a\n    to: b\n", want: "form"},
 		"empty route":     {yaml: "routes:\n  - from: a\n", want: "непустые from и to"},
 		"no routes":       {yaml: "# nothing yet\n", want: "нет ни одного маршрута"},
-		"both env & file": {yaml: "routes: []\n", telegram: "@a", max: "b", want: "оставьте что-то одно"},
-		"half of a pair":  {telegram: "@a", want: "и TELEGRAM_CHANNEL, и MAX_CHANNEL"},
+		"both env & file": {yaml: "routes: []\n", telegram: "@a", target: "b", want: "оставьте что-то одно"},
+		"no target":       {telegram: "@a", want: "хотя бы одно из MAX_CHANNEL, VK_GROUP"},
 		"nothing at all":  {want: "маршруты не заданы"},
 	}
 	for name, c := range cases {
@@ -66,10 +66,38 @@ func TestConfigMistakesAreReported(t *testing.T) {
 			if c.yaml != "" {
 				path = writeConfig(t, c.yaml)
 			}
-			_, err := loadRoutes(path, c.telegram, c.max)
+			var targets refs
+			if c.target != "" {
+				targets = refs{c.target}
+			}
+			_, err := loadRoutes(path, c.telegram, targets)
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("err %v, want %q", err, c.want)
 			}
 		})
+	}
+}
+
+func TestTokensAreRequiredOnlyForUsedPlatforms(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CONFIG_FILE", filepath.Join(dir, "missing.yaml"))
+	t.Setenv("TELEGRAM_BOT_TOKEN", "1:x")
+	t.Setenv("TELEGRAM_CHANNEL", "@news")
+	t.Setenv("MAX_CHANNEL", "")
+	t.Setenv("MAX_BOT_TOKEN", "")
+	t.Setenv("VK_GROUP", "my_group")
+	t.Setenv("VK_TOKEN", "")
+
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "VK_TOKEN") || strings.Contains(err.Error(), "MAX_BOT_TOKEN") {
+		t.Fatalf("err %v", err)
+	}
+
+	t.Setenv("VK_TOKEN", "vk1.a.token")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.routes[0].To, refs{"vk:my_group"}) {
+		t.Fatalf("routes %+v", cfg.routes)
 	}
 }

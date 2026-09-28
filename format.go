@@ -175,18 +175,55 @@ func (t richText) render(from, to int) string {
 	return out.String()
 }
 
+// plain renders the range [from, to) as plain text for platforms without
+// markup (VK). A link hidden under words keeps its address: "words (https://…)".
+func (t richText) plain(from, to int) string {
+	type insert struct {
+		at   int
+		text string
+	}
+	var inserts []insert
+	for _, e := range t.entities {
+		end := min(e.Offset+e.Length, to, len(t.units))
+		if e.Type != models.MessageEntityTypeTextLink || e.URL == "" || e.Offset < 0 || max(e.Offset, from) >= end {
+			continue
+		}
+		if label := string(utf16.Decode(t.units[e.Offset:end])); strings.TrimSpace(label) == e.URL {
+			continue
+		}
+		inserts = append(inserts, insert{end, " (" + e.URL + ")"})
+	}
+	sort.SliceStable(inserts, func(a, b int) bool { return inserts[a].at < inserts[b].at })
+
+	var out strings.Builder
+	pos := from
+	for _, in := range inserts {
+		out.WriteString(string(utf16.Decode(t.units[pos:in.at])))
+		out.WriteString(in.text)
+		pos = in.at
+	}
+	out.WriteString(string(utf16.Decode(t.units[pos:to])))
+
+	return out.String()
+}
+
 // split cuts the text into parts that each fit into limit as HTML. A border
 // goes at a blank line, then at a line break, then at a space, and only as a
 // last resort in the middle of a word.
 func (t richText) split(limit int) []string {
+	return t.splitBy(limit, t.render)
+}
+
+// splitBy is split for any rendering: HTML for MAX, plain text for VK.
+func (t richText) splitBy(limit int, render func(from, to int) string) []string {
 	var parts []string
 	end := trimRight(t.units, len(t.units))
 	for from := skipSpace(t.units, 0); from < end; {
 		to := end
-		if htmlLen(t.render(from, to)) > limit {
-			to = t.cut(from, end, limit)
+		if htmlLen(render(from, to)) > limit {
+			to = t.cut(from, end, limit, render)
 		}
-		parts = append(parts, t.render(from, trimRight(t.units, to)))
+		parts = append(parts, render(from, trimRight(t.units, to)))
 		from = skipSpace(t.units, to)
 	}
 
@@ -194,9 +231,9 @@ func (t richText) split(limit int) []string {
 }
 
 // cut finds the farthest border of the part starting at from.
-func (t richText) cut(from, end, limit int) int {
+func (t richText) cut(from, end, limit int, render func(from, to int) string) int {
 	fits := func(to int) bool {
-		return htmlLen(t.render(from, trimRight(t.units, to))) <= limit
+		return htmlLen(render(from, trimRight(t.units, to))) <= limit
 	}
 
 	for _, sep := range [][]uint16{{'\n', '\n'}, {'\n'}, {' '}} {

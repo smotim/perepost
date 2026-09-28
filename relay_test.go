@@ -41,8 +41,9 @@ type sent struct {
 // fake is a fake Telegram and MAX with a relay and a source wired to them:
 // posts of channel -100 go to MAX channel -42.
 type fake struct {
-	relay  *relay
-	source *source
+	relay     *relay
+	source    *source
+	maxClient *maxClient
 
 	tgAdmin, maxAdmin, maxRejects atomic.Bool
 	uploads                       atomic.Int32
@@ -154,16 +155,16 @@ func fakes(t *testing.T) *fake {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.maxClient = &maxClient{api: api, http: maxServer.Client(), token: "max-token"}
 	f.relay = &relay{
 		tg:        tg,
-		max:       &maxClient{api: api, http: maxServer.Client(), token: "max-token"},
 		http:      tgServer.Client(),
 		adminID:   777,
 		fileLimit: tgDownloadLimit,
 	}
 	f.source = &source{
 		channel: &models.ChatFullInfo{ID: -100, Title: "Канал", Username: "channel"},
-		to:      []maxChat{{id: -42, title: "Канал MAX"}},
+		to:      []destination{&maxChannel{client: f.maxClient, id: -42, title: "Канал MAX"}},
 	}
 
 	return f
@@ -215,7 +216,7 @@ func TestFilesGoSeparatelyAndOnlyFirstMessageNotifies(t *testing.T) {
 
 func TestPostGoesToEveryDestination(t *testing.T) {
 	f := fakes(t)
-	f.source.to = append(f.source.to, maxChat{id: -43, title: "Второй канал MAX"})
+	f.source.to = append(f.source.to, &maxChannel{client: f.maxClient, id: -43, title: "Второй канал MAX"})
 	f.forward(&models.Message{ID: 5, Caption: "Фото", Photo: []models.PhotoSize{{FileID: "p"}}})
 
 	got := f.messages()

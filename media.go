@@ -7,28 +7,26 @@ import (
 	"unicode/utf16"
 
 	"github.com/go-telegram/bot/models"
-	"github.com/max-messenger/max-bot-api-client-go/v2/model"
 )
 
-// media is an attachment of a Telegram post and what it becomes in MAX.
+// media is an attachment of a Telegram post.
 type media struct {
 	fileID string
 	size   int64
 	name   string
-	upload model.UploadType
-	attach model.AttachmentType
+	kind   mediaKind
 }
 
 func mediaOf(m *models.Message) (media, bool) {
 	image := func(sizes []models.PhotoSize) media {
 		p := sizes[len(sizes)-1] // the largest size
-		return media{p.FileID, int64(p.FileSize), "photo.jpg", model.UploadImage, model.AttachImage}
+		return media{p.FileID, int64(p.FileSize), "photo.jpg", kindImage}
 	}
 	video := func(fileID string, size int64, name, fallback string) media {
-		return media{fileID, size, cmp.Or(name, fallback), model.UploadVideo, model.AttachVideo}
+		return media{fileID, size, cmp.Or(name, fallback), kindVideo}
 	}
 	file := func(fileID string, size int64, name, fallback string) media {
-		return media{fileID, size, cmp.Or(name, fallback), model.UploadFile, model.AttachFile}
+		return media{fileID, size, cmp.Or(name, fallback), kindFile}
 	}
 
 	switch {
@@ -44,7 +42,7 @@ func mediaOf(m *models.Message) (media, bool) {
 	case m.VideoNote != nil:
 		return video(m.VideoNote.FileID, int64(m.VideoNote.FileSize), "", "video_note.mp4"), true
 	case m.Voice != nil:
-		return media{m.Voice.FileID, m.Voice.FileSize, "voice.ogg", model.UploadAudio, model.AttachAudio}, true
+		return media{m.Voice.FileID, m.Voice.FileSize, "voice.ogg", kindAudio}, true
 	case m.Audio != nil:
 		return file(m.Audio.FileID, m.Audio.FileSize, m.Audio.FileName, "audio.mp3"), true
 	case m.Document != nil:

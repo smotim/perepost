@@ -20,22 +20,31 @@ import (
 	"github.com/max-messenger/max-bot-api-client-go/v2/model"
 )
 
-// attachment is a file already uploaded to MAX.
-type attachment struct {
-	kind  model.AttachmentType
-	token string
-}
-
 func isNumber(s string) bool {
 	_, err := strconv.ParseInt(s, 10, 64)
 
 	return err == nil
 }
 
-// maxChat is a MAX channel the bot posts to.
-type maxChat struct {
-	id    int64
-	title string
+// maxChannel is a MAX channel the bot posts to.
+type maxChannel struct {
+	client *maxClient
+	id     int64
+	title  string
+}
+
+func (c *maxChannel) key() string  { return "max:" + strconv.FormatInt(c.id, 10) }
+func (c *maxChannel) name() string { return "«" + c.title + "» (MAX)" }
+
+// maxKinds maps a media kind to what MAX calls it on upload and in a message.
+var maxKinds = map[mediaKind]struct {
+	upload model.UploadType
+	attach model.AttachmentType
+}{
+	kindImage: {model.UploadImage, model.AttachImage},
+	kindVideo: {model.UploadVideo, model.AttachVideo},
+	kindAudio: {model.UploadAudio, model.AttachAudio},
+	kindFile:  {model.UploadFile, model.AttachFile},
 }
 
 type maxClient struct {
@@ -106,7 +115,7 @@ func (t retryableStatus) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // resolve finds a channel by link (https://max.ru/name), name or id and
 // checks that the bot may post there.
-func (m *maxClient) resolve(ctx context.Context, ref string) (maxChat, error) {
+func (m *maxClient) resolve(ctx context.Context, ref string) (*maxChannel, error) {
 	var (
 		chat model.Chat
 		err  error
@@ -124,22 +133,22 @@ func (m *maxClient) resolve(ctx context.Context, ref string) (maxChat, error) {
 			hint = "у каналов MAX id отрицательный — попробуйте -" + ref
 		}
 
-		return maxChat{}, fmt.Errorf("канал MAX %q не найден (%w): %s", ref, err, hint)
+		return nil, fmt.Errorf("канал MAX %q не найден (%w): %s", ref, err, hint)
 	}
 
-	c := maxChat{id: chat.ChatID, title: chat.Title}
+	c := &maxChannel{client: m, id: chat.ChatID, title: chat.Title}
 
-	return c, m.checkAdmin(ctx, c)
+	return c, c.checkAdmin(ctx)
 }
 
 // checkAdmin checks that the bot can still post to the channel.
-func (m *maxClient) checkAdmin(ctx context.Context, chat maxChat) error {
-	member, err := m.api.Chats.GetMembership(ctx, chat.id)
+func (c *maxChannel) checkAdmin(ctx context.Context) error {
+	member, err := c.client.api.Chats.GetMembership(ctx, c.id)
 	if err != nil {
-		return fmt.Errorf("не удалось проверить права бота в канале MAX «%s»: %w", chat.title, err)
+		return fmt.Errorf("не удалось проверить права бота в канале MAX «%s»: %w", c.title, err)
 	}
 	if !member.IsAdmin && !member.IsOwner {
-		return fmt.Errorf("бот не администратор канала MAX «%s»: публиковать в канале могут только администраторы", chat.title)
+		return fmt.Errorf("бот не администратор канала MAX «%s»: публиковать в канале могут только администраторы", c.title)
 	}
 
 	return nil
@@ -168,14 +177,63 @@ func (m *maxClient) get(ctx context.Context, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func (m *maxClient) upload(ctx context.Context, kind model.UploadType, name string, file tgFile) (string, error) {
+func (c *maxChannel) upload(ctx context.Context, md media, file tgFile) (attachment, error) {
 	r, err := file.open()
 	if err != nil {
-		return "", err
+		return attachment{}, err
 	}
 	defer func() { _ = r.Close() }()
 
-	return m.api.Upload.Upload(ctx, kind, r, name, file.size)
+	token, err := c.client.api.Upload.Upload(ctx, maxKinds[md.kind].upload, r, md.name, file.size)
+
+	return attachment{kind: md.kind, ref: token}, err
+}
+
+// publish posts to MAX as several messages when needed: photos and videos with
+// the start of the text first, then the rest of the text split by the MAX
+// limit, then the files one per message — MAX allows a file only on its own.
+// Only the first message notifies subscribers, as a single post would.
+func (c *maxChannel) publish(ctx context.Context, text richText, attachments []attachment, preview bool) (int, error) {
+	var first, files []attachment
+	for _, a := range attachments {
+		if a.kind == kindFile || a.kind == kindAudio {
+			files = append(files, a)
+		} else {
+			first = append(first, a)
+		}
+	}
+	if len(first) == 0 && len(files) > 0 {
+		first, files = files[:1], files[1:]
+	}
+	parts := text.split(maxTextLimit)
+	if len(parts) == 0 && len(first) == 0 {
+		return 0, nil
+	}
+
+	type message struct {
+		text        string
+		attachments []attachment
+	}
+	caption := ""
+	if len(parts) > 0 {
+		caption, parts = parts[0], parts[1:]
+	}
+	messages := []message{{caption, first}}
+	for _, part := range parts {
+		messages = append(messages, message{text: part})
+	}
+	for _, f := range files {
+		messages = append(messages, message{attachments: []attachment{f}})
+	}
+
+	for i, msg := range messages {
+		err := retry(ctx, func() error { return c.client.send(ctx, c.id, msg.text, msg.attachments, i == 0, preview) })
+		if err != nil {
+			return i, fmt.Errorf("сообщение %d из %d не отправлено: %w", i+1, len(messages), err)
+		}
+	}
+
+	return len(messages), nil
 }
 
 func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, notify, preview bool) error {
@@ -184,7 +242,7 @@ func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachm
 		msg.SetText(html).SetFormat(model.FormatHTML)
 	}
 	for _, a := range attachments {
-		msg.AddAttachByToken(a.token, a.kind)
+		msg.AddAttachByToken(a.ref, maxKinds[a.kind].attach)
 	}
 	if !notify {
 		msg.WithoutNotify()

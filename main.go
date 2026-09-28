@@ -95,20 +95,25 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("не удалось подключиться к Telegram: %w", err)
 	}
-	maxc, err := newMaxClient(cfg.maxToken)
-	if err != nil {
-		return fmt.Errorf("не удалось подключиться к MAX: %w", err)
+	targets := platforms{}
+	if cfg.maxToken != "" {
+		if targets.max, err = newMaxClient(cfg.maxToken); err != nil {
+			return fmt.Errorf("не удалось подключиться к MAX: %w", err)
+		}
+	}
+	if cfg.vkToken != "" {
+		targets.vk = newVKClient(cfg.vkToken)
 	}
 
 	setup, cancel := context.WithTimeout(ctx, setupTimeout)
 	defer cancel()
-	sources, err = connect(setup, tg, maxc, cfg.routes)
+	sources, err = connect(setup, tg, targets, cfg.routes)
 	if err != nil {
 		return err
 	}
 	list := slices.SortedFunc(maps.Values(sources), func(a, b *source) int { return cmp.Compare(a.channel.Title, b.channel.Title) })
 
-	r := &relay{tg: tg, max: maxc, http: &http.Client{Timeout: 5 * time.Minute}, adminID: cfg.adminID, fileLimit: fileLimit}
+	r := &relay{tg: tg, http: &http.Client{Timeout: 5 * time.Minute}, adminID: cfg.adminID, fileLimit: fileLimit}
 	// Sending outlives the stop signal: posts already received get delivered
 	sending, abort := context.WithCancel(context.Background())
 	defer abort()
@@ -153,29 +158,44 @@ func run() error {
 	return nil
 }
 
+// platforms holds a client for every platform that has a token.
+type platforms struct {
+	max *maxClient
+	vk  *vkClient
+}
+
+// open finds a destination by its reference on the platform it points to.
+func (p platforms) open(ctx context.Context, ref string) (destination, error) {
+	if isVK(ref) {
+		return p.vk.resolve(ctx, ref)
+	}
+
+	return p.max.resolve(ctx, ref)
+}
+
 // connect resolves every channel of the routes and checks the bot's rights in
 // each. A channel met in several routes is resolved once, and a source gets
 // the destinations of every route it appears in.
-func connect(ctx context.Context, tg *bot.Bot, maxc *maxClient, routes []route) (map[int64]*source, error) {
+func connect(ctx context.Context, tg *bot.Bot, p platforms, routes []route) (map[int64]*source, error) {
 	if err := checkWebhook(ctx, tg); err != nil {
 		return nil, err
 	}
 
 	channels := map[string]*models.ChatFullInfo{}
-	chats := map[string]maxChat{}
+	opened := map[string]destination{}
 	sources := map[int64]*source{}
 	for _, rt := range routes {
-		var to []maxChat
+		var to []destination
 		for _, ref := range rt.To {
-			chat, ok := chats[ref]
+			dst, ok := opened[ref]
 			if !ok {
 				var err error
-				if chat, err = maxc.resolve(ctx, ref); err != nil {
+				if dst, err = p.open(ctx, ref); err != nil {
 					return nil, err
 				}
-				chats[ref] = chat
+				opened[ref] = dst
 			}
-			to = append(to, chat)
+			to = append(to, dst)
 		}
 
 		for _, ref := range rt.From {
@@ -192,29 +212,32 @@ func connect(ctx context.Context, tg *bot.Bot, maxc *maxClient, routes []route) 
 				src = &source{channel: channel, posts: newQueue(albumWait)}
 				sources[channel.ID] = src
 			}
-			for _, chat := range to {
-				if !slices.ContainsFunc(src.to, func(c maxChat) bool { return c.id == chat.id }) {
-					src.to = append(src.to, chat)
-				}
-			}
+			src.to = appendNew(src.to, to...)
 		}
 	}
 
 	return sources, nil
 }
 
-// destinations lists every MAX channel once.
-func destinations(sources []*source) []maxChat {
-	var all []maxChat
+// destinations lists every destination once.
+func destinations(sources []*source) []destination {
+	var all []destination
 	for _, src := range sources {
-		for _, chat := range src.to {
-			if !slices.ContainsFunc(all, func(c maxChat) bool { return c.id == chat.id }) {
-				all = append(all, chat)
-			}
-		}
+		all = appendNew(all, src.to...)
 	}
 
 	return all
+}
+
+// appendNew appends the destinations that are not in list yet.
+func appendNew(list []destination, more ...destination) []destination {
+	for _, dst := range more {
+		if !slices.ContainsFunc(list, func(d destination) bool { return d.key() == dst.key() }) {
+			list = append(list, dst)
+		}
+	}
+
+	return list
 }
 
 // describe renders the routes for the log and the startup message.
@@ -222,8 +245,8 @@ func describe(sources []*source) string {
 	lines := make([]string, 0, len(sources))
 	for _, src := range sources {
 		names := make([]string, 0, len(src.to))
-		for _, chat := range src.to {
-			names = append(names, "«"+chat.title+"»")
+		for _, dst := range src.to {
+			names = append(names, dst.name())
 		}
 		lines = append(lines, fmt.Sprintf("«%s» → %s", src.channel.Title, strings.Join(names, ", ")))
 	}

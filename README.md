@@ -1,15 +1,15 @@
 # perepost
 
-**English:** a self-hosted bot that mirrors Telegram channel posts to [MAX](https://max.ru) channels —
-with formatting, photos, videos, albums and files, within a second or two of publishing. Any
-number of Telegram channels to any number of MAX channels. One small Go binary or Docker image.
-The documentation below is in Russian, since MAX is a Russian messenger.
+**English:** a self-hosted bot that mirrors Telegram channel posts to [MAX](https://max.ru) channels
+and VK communities — with formatting, photos, videos, albums and files, within a second or two of
+publishing. Any number of Telegram channels to any number of destinations. One small Go binary or
+Docker image. The documentation below is in Russian, since MAX and VK are Russian platforms.
 
 ---
 
-Бот, который переносит посты каналов Telegram в каналы MAX: с разметкой, фото, видео, альбомами и
-файлами. Новый пост появляется в MAX через секунду-две после публикации. Каналов может быть сколько
-угодно в обе стороны: один в один, один во много, много в один.
+Бот, который переносит посты каналов Telegram в каналы MAX и сообщества ВКонтакте: с разметкой, фото,
+видео, альбомами и файлами. Новый пост появляется через секунду-две после публикации. Каналов может
+быть сколько угодно в обе стороны: один в один, один во много, много в один, и в MAX, и в VK сразу.
 
 ## Что переносится
 
@@ -29,6 +29,13 @@ The documentation below is in Russian, since MAX is a Russian messenger.
 Длинный пост, который не влезает в лимит MAX (4000 символов вместе с разметкой), уходит
 несколькими сообщениями подряд. Режется по абзацам, разметка в каждой части закрыта.
 Уведомление подписчики MAX получают только по первому сообщению.
+
+### Во ВКонтакте
+
+Пост уходит на стену сообщества от его имени, одним постом: текст и до десяти фото, видео и файлов
+вместе. Оформления на стенах VK нет, поэтому текст приходит без жирного и курсива, а ссылка,
+спрятанная под словом, раскрывается: «билеты (https://…)». Файлы и музыка — документами VK, голосовые
+тоже.
 
 ## Ограничения
 
@@ -115,6 +122,28 @@ routes:
 
 Порядок постов сохраняется внутри каждого канала, а каналы обрабатываются параллельно: длинное
 видео в одном канале не задерживает остальные.
+
+## ВКонтакте
+
+Для VK нужен **ключ доступа пользователя**, который в сообществе редактор или администратор: ключом
+сообщества VK не даёт публиковать на стене и загружать фото и видео.
+
+1. Назначьте аккаунт редактором сообщества (Управление → Участники → Руководители). Лучше отдельный
+   аккаунт: ключ даёт доступ к нему в пределах выданных прав.
+2. Получите бессрочный ключ с правами `wall, photos, video, docs, groups, offline` — через своё
+   Standalone-приложение VK или [vkhost.github.io](https://vkhost.github.io): откроется окно
+   авторизации VK, после разрешения ключ окажется в адресной строке страницы
+   `oauth.vk.com/blank.html` (параметр `access_token`). Ключ действует, пока вы его не отзовёте или
+   не смените пароль аккаунта.
+3. В `.env`:
+
+   ```env
+   VK_TOKEN=vk1.a....
+   VK_GROUP=https://vk.com/my_group    # для одной пары; в config.yaml — просто ссылка в to
+   ```
+
+Если аккаунт перестанет быть редактором, проверка здоровья это заметит и напишет на
+`TELEGRAM_ADMIN_ID`.
 
 ## Видео больше 20 МБ
 

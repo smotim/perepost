@@ -12,15 +12,14 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
-	"github.com/max-messenger/max-bot-api-client-go/v2/model"
 )
 
-// source is a Telegram channel together with the MAX channels its posts go to.
+// source is a Telegram channel together with the destinations its posts go to.
 // Each source has its own queue: order matters within a channel only, and a
 // long video upload in one channel must not hold back the others.
 type source struct {
 	channel *models.ChatFullInfo
-	to      []maxChat
+	to      []destination
 	posts   *queue
 }
 
@@ -33,28 +32,18 @@ func (s *source) postRef(id int) string {
 	return "https://t.me/" + s.channel.Username + "/" + strconv.Itoa(id)
 }
 
-// relay moves posts of Telegram channels into MAX channels.
+// relay moves posts of Telegram channels to MAX channels and VK communities.
 type relay struct {
 	tg        *bot.Bot
-	max       *maxClient
 	http      *http.Client
 	adminID   int64 // Telegram user to report failures to; 0 — nobody
 	fileLimit int64 // largest file Telegram hands out; 0 — no limit (local Bot API server)
 }
 
-// uploads are the attachments of one post uploaded for one MAX channel.
+// uploads are the attachments of one post uploaded for one destination.
 type uploads struct {
-	visual []attachment // photos and videos: go together, like an album
-	files  []attachment // files and audio: MAX allows only one per message
-	failed bool
-}
-
-func (u *uploads) add(a attachment) {
-	if a.kind == model.AttachFile || a.kind == model.AttachAudio {
-		u.files = append(u.files, a)
-	} else {
-		u.visual = append(u.visual, a)
-	}
+	attachments []attachment
+	failed      bool
 }
 
 func (r *relay) forward(ctx context.Context, src *source, p *post) {
@@ -113,79 +102,40 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 			continue
 		}
 		for i, dst := range src.to {
-			a, err := r.upload(ctx, md, file)
+			a, err := r.upload(ctx, dst, md, file)
 			if err != nil {
-				log.Error("вложение не загружено в MAX", "file", md.name, "to", dst.title, "err", err)
-				problems = append(problems, fmt.Sprintf("%s → «%s»: %v", md.name, dst.title, err))
+				log.Error("вложение не загружено", "file", md.name, "to", dst.name(), "err", err)
+				problems = append(problems, fmt.Sprintf("%s → %s: %v", md.name, dst.name(), err))
 				uploaded[i].failed = true
 
 				continue
 			}
-			uploaded[i].add(a)
+			uploaded[i].attachments = append(uploaded[i].attachments, a)
 		}
 		file.remove()
 	}
 
 	for i, dst := range src.to {
 		body := text.clone()
-		// A private channel's link would not open for MAX readers
+		// A private channel's link would not open for readers elsewhere
 		if (lost || uploaded[i].failed) && src.channel.Username != "" {
 			body.append(linkText("Открыть пост в Telegram", ref))
 		}
-		n, err := r.send(ctx, dst, body.split(maxTextLimit), uploaded[i], preview)
+		n, err := dst.publish(ctx, body, uploaded[i].attachments, preview)
 		if err != nil {
-			log.Error("не отправлено в MAX", "to", dst.title, "err", err)
-			problems = append(problems, fmt.Sprintf("«%s»: %v", dst.title, err))
+			log.Error("не опубликовано", "to", dst.name(), "err", err)
+			problems = append(problems, fmt.Sprintf("%s: %v", dst.name(), err))
 
 			continue
 		}
 		if n > 0 {
-			log.Info("переслано", "to", dst.title, "messages", n)
+			log.Info("переслано", "to", dst.name(), "messages", n)
 		}
 	}
 
 	if len(problems) > 0 {
 		_ = r.alert(fmt.Sprintf("пост %s перенесён с ошибками:\n— %s", ref, strings.Join(problems, "\n— ")))
 	}
-}
-
-// send posts a message set to a MAX channel: attachments with the start of the
-// text first, then the rest of the text, then the files one per message. Only
-// the first message notifies subscribers, as a single post would. It returns
-// how many messages went out.
-func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads, preview bool) (int, error) {
-	first, files := u.visual, u.files
-	if len(first) == 0 && len(files) > 0 {
-		first, files = files[:1], files[1:]
-	}
-	if len(parts) == 0 && len(first) == 0 {
-		return 0, nil
-	}
-
-	type message struct {
-		text        string
-		attachments []attachment
-	}
-	caption := ""
-	if len(parts) > 0 {
-		caption, parts = parts[0], parts[1:]
-	}
-	messages := []message{{caption, first}}
-	for _, part := range parts {
-		messages = append(messages, message{text: part})
-	}
-	for _, f := range files {
-		messages = append(messages, message{attachments: []attachment{f}})
-	}
-
-	for i, msg := range messages {
-		err := retry(ctx, func() error { return r.max.send(ctx, dst.id, msg.text, msg.attachments, i == 0, preview) })
-		if err != nil {
-			return i, fmt.Errorf("сообщение %d из %d не отправлено: %w", i+1, len(messages), err)
-		}
-	}
-
-	return len(messages), nil
 }
 
 func (r *relay) download(ctx context.Context, md media) (tgFile, error) {
@@ -203,15 +153,15 @@ func (r *relay) download(ctx context.Context, md media) (tgFile, error) {
 	return file, err
 }
 
-func (r *relay) upload(ctx context.Context, md media, file tgFile) (attachment, error) {
-	var token string
+func (r *relay) upload(ctx context.Context, dst destination, md media, file tgFile) (attachment, error) {
+	var a attachment
 	err := retry(ctx, func() (err error) {
-		token, err = r.max.upload(ctx, md.upload, md.name, file)
+		a, err = dst.upload(ctx, md, file)
 
 		return err
 	})
 
-	return attachment{kind: md.attach, token: token}, err
+	return a, err
 }
 
 // alert writes to the admin in Telegram when TELEGRAM_ADMIN_ID is set.
