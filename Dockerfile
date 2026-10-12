@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /perepost .
 
 # distroless/static: CA certificates and the binary, no shell
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /perepost /perepost
 ENV CONFIG_FILE=/etc/perepost/config.yaml
 ENTRYPOINT ["/perepost"]
