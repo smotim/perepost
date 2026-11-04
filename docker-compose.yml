@@ -9,6 +9,7 @@ services:
       # Routes for several channels: ./config/config.yaml (see config.example.yaml)
       - ./config:/etc/perepost:ro
       - bot-api-files:/var/lib/telegram-bot-api
+      - perepost-state:/var/lib/perepost
     depends_on:
       telegram-bot-api:
         condition: service_started
@@ -43,3 +44,4 @@ services:
 
 volumes:
   bot-api-files:
+  perepost-state:

@@ -3,5 +3,6 @@
 .env
 config/
 config.yaml
+perepost.sqlite*
 dist/
 *.md

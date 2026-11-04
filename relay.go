@@ -21,8 +21,10 @@ import (
 type source struct {
 	channel *models.ChatFullInfo
 	to      []maxChat
-	posts   *queue
+	changes map[int64]syncOptions
 }
+
+type post struct{ messages []*models.Message }
 
 // postRef points a human to a post: a link for a public channel, a number otherwise.
 func (s *source) postRef(id int) string {
@@ -35,11 +37,17 @@ func (s *source) postRef(id int) string {
 
 // relay moves posts of Telegram channels into MAX channels.
 type relay struct {
-	tg        *bot.Bot
-	max       *maxClient
-	http      *http.Client
-	adminID   int64 // Telegram user to report failures to; 0 — nobody
-	fileLimit int64 // largest file Telegram hands out; 0 — no limit (local Bot API server)
+	tg           *bot.Bot
+	max          *maxClient
+	http         *http.Client
+	adminID      int64 // Telegram user to report failures to; 0 — nobody
+	fileLimit    int64 // largest file Telegram hands out; 0 — no limit (local Bot API server)
+	tgAPI        telegramAPI
+	maxMediaHTTP *http.Client
+	mediaDir     string
+	maxFileLimit int64
+	maxPostLimit int64
+	mediaSlot    chan struct{} // only one MAX media post occupies disk at a time
 }
 
 // uploads are the attachments of one post uploaded for one MAX channel.
@@ -57,7 +65,7 @@ func (u *uploads) add(a attachment) {
 	}
 }
 
-func (r *relay) forward(ctx context.Context, src *source, p *post) {
+func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliveryBook) {
 	msgs := slices.SortedFunc(slices.Values(p.messages), func(a, b *models.Message) int { return a.ID - b.ID })
 	ref := src.postRef(msgs[0].ID)
 	log := slog.With("channel", src.channel.Title, "post", msgs[0].ID)
@@ -65,28 +73,20 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 		if v := recover(); v != nil {
 			log.Error("сбой при пересылке", "panic", v)
 			_ = r.alert(fmt.Sprintf("сбой при пересылке поста %s: %v", ref, v))
+			if book != nil {
+				// A publication may be in flight. Startup recovers its journal state.
+				book.err = fmt.Errorf("обработка поста %s прервана: %v", ref, v)
+			}
 		}
 	}()
 
 	var (
-		text     richText
 		files    []media
 		lost     bool // part of the post cannot reach MAX: readers get a link to the original
 		problems []string
-		preview  = true
 	)
-	if from, ok := forwardedFrom(msgs[0]); ok {
-		text.append(from)
-	}
+	text, preview := telegramPostText(msgs)
 	for _, m := range msgs {
-		if m.Text != "" {
-			text.append(newRichText(m.Text, m.Entities))
-		} else {
-			text.append(newRichText(m.Caption, m.CaptionEntities))
-		}
-		if o := m.LinkPreviewOptions; o != nil && o.IsDisabled != nil && *o.IsDisabled {
-			preview = false
-		}
 		if md, ok := mediaOf(m); ok {
 			files = append(files, md)
 		} else if unsupported(m) {
@@ -132,7 +132,12 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 		if (lost || uploaded[i].failed) && src.channel.Username != "" {
 			body.append(linkText("Открыть пост в Telegram", ref))
 		}
-		n, err := r.send(ctx, dst, body.split(maxTextLimit), uploaded[i], preview)
+		var n int
+		err := book.deliver(ctx, channelKey{maxPlatform, dst.id}, func(publish publish) (err error) {
+			n, err = r.send(ctx, dst, body.split(maxTextLimit), uploaded[i], preview, publish)
+
+			return err
+		})
 		if err != nil {
 			log.Error("не отправлено в MAX", "to", dst.title, "err", err)
 			problems = append(problems, fmt.Sprintf("«%s»: %v", dst.title, err))
@@ -153,7 +158,7 @@ func (r *relay) forward(ctx context.Context, src *source, p *post) {
 // text first, then the rest of the text, then the files one per message. Only
 // the first message notifies subscribers, as a single post would. It returns
 // how many messages went out.
-func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads, preview bool) (int, error) {
+func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads, preview bool, publish publish) (int, error) {
 	first, files := u.visual, u.files
 	if len(first) == 0 && len(files) > 0 {
 		first, files = files[:1], files[1:]
@@ -179,7 +184,18 @@ func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads
 	}
 
 	for i, msg := range messages {
-		err := retry(ctx, func() error { return r.max.send(ctx, dst.id, msg.text, msg.attachments, i == 0, preview) })
+		kind := mirrorText
+		if len(msg.attachments) > 0 {
+			kind = mirrorMedia
+			if i == 0 {
+				kind = mirrorCaption
+			}
+		}
+		err := publish(ctx, func() ([]string, error) {
+			return retryPublish(ctx, func() ([]string, error) {
+				return r.max.send(ctx, dst.id, msg.text, msg.attachments, i == 0, preview)
+			})
+		}, kind)
 		if err != nil {
 			return i, fmt.Errorf("сообщение %d из %d не отправлено: %w", i+1, len(messages), err)
 		}

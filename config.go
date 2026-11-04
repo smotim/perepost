@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,13 +25,101 @@ type config struct {
 	adminID       int64  // Telegram user to report failures to; 0 — nobody
 	heartbeat     string // URL to POST to after every successful health check
 	telegramAPI   string // own Bot API server (--local mode): files up to 2 GB instead of 20 MB
+	stateFile     string
+	maxWebhookURL string
+	maxListen     string
+	maxSecret     string
+	tgWebhookURL  string
+	tgSecret      string
 	routes        []route
 }
 
 // route sends every post of each "from" channel to each "to" channel.
 type route struct {
-	From refs `yaml:"from"`
-	To   refs `yaml:"to"`
+	Name        string `yaml:"name"`
+	Enabled     *bool  `yaml:"enabled"`
+	From        refs   `yaml:"from"`
+	To          refs   `yaml:"to"`
+	reverse     bool
+	syncEdits   bool
+	syncDeletes bool
+}
+
+type platform string
+
+const (
+	telegramPlatform platform = "telegram"
+	maxPlatform      platform = "max"
+)
+
+var validWebhookSecret = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,256}$`)
+
+func (r *route) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("строка %d: нужен объект маршрута", node.Line)
+	}
+	platforms := [2]platform{telegramPlatform, maxPlatform}
+	seen := map[string]bool{}
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		if seen[key] {
+			return fmt.Errorf("строка %d: поле %q повторяется", value.Line, key)
+		}
+		seen[key] = true
+		var err error
+		switch key {
+		case "name":
+			err = value.Decode(&r.Name)
+		case "enabled":
+			err = value.Decode(&r.Enabled)
+		case "sync_edits":
+			err = value.Decode(&r.syncEdits)
+		case "sync_deletes":
+			err = value.Decode(&r.syncDeletes)
+		case "from":
+			err = decodeEndpoint(value, &r.From, &platforms[0])
+		case "to":
+			err = decodeEndpoint(value, &r.To, &platforms[1])
+		default:
+			return fmt.Errorf("строка %d: неизвестное поле %q", value.Line, key)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if platforms[0] == platforms[1] {
+		return fmt.Errorf("строка %d: from и to должны быть на разных платформах", node.Line)
+	}
+	r.reverse = platforms[0] == maxPlatform
+
+	return nil
+}
+
+func decodeEndpoint(node *yaml.Node, channels *refs, p *platform) error {
+	if node.Kind != yaml.MappingNode {
+		return node.Decode(channels)
+	}
+	seenPlatform, seenChannels := false, false
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		switch {
+		case key == "platform" && !seenPlatform:
+			*p = platform(value.Value)
+			seenPlatform = true
+		case (key == "channel" || key == "channels") && !seenChannels:
+			if err := value.Decode(channels); err != nil {
+				return err
+			}
+			seenChannels = true
+		default:
+			return fmt.Errorf("строка %d: неизвестное или повторное поле %q", value.Line, key)
+		}
+	}
+	if !seenPlatform || (*p != telegramPlatform && *p != maxPlatform) {
+		return fmt.Errorf("строка %d: platform должен быть telegram или max", node.Line)
+	}
+
+	return nil
 }
 
 // refs is a channel or a list of channels: a link, @name or numeric id.
@@ -62,6 +152,12 @@ func loadConfig() (config, error) {
 		maxToken:      env("MAX_BOT_TOKEN"),
 		heartbeat:     env("HEARTBEAT_URL"),
 		telegramAPI:   strings.TrimSuffix(env("TELEGRAM_API_URL"), "/"),
+		stateFile:     env("STATE_FILE"),
+		maxWebhookURL: env("MAX_WEBHOOK_URL"),
+		maxListen:     env("MAX_WEBHOOK_LISTEN"),
+		maxSecret:     env("MAX_WEBHOOK_SECRET"),
+		tgWebhookURL:  env("TELEGRAM_WEBHOOK_URL"),
+		tgSecret:      env("TELEGRAM_WEBHOOK_SECRET"),
 	}
 	var missing []string
 	if c.telegramToken == "" {
@@ -94,8 +190,40 @@ func loadConfig() (config, error) {
 	}
 	routes, err := loadRoutes(path, env("TELEGRAM_CHANNEL"), env("MAX_CHANNEL"))
 	c.routes = routes
+	if err != nil {
+		return c, err
+	}
+	if c.stateFile == "" {
+		c.stateFile = "perepost.sqlite"
+	}
+	if c.maxListen == "" {
+		c.maxListen = cmp.Or(env("WEBHOOK_LISTEN"), "127.0.0.1:8090")
+	}
+	if c.tgWebhookURL != "" {
+		u, err := url.Parse(c.tgWebhookURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" ||
+			u.Path == "" || u.Path == "/" || (u.Port() != "" && u.Port() != "443") {
+			return c, errors.New("TELEGRAM_WEBHOOK_URL — публичный HTTPS-адрес с отдельным путём на порту 443")
+		}
+		if !validWebhookSecret.MatchString(c.tgSecret) {
+			return c, errors.New("TELEGRAM_WEBHOOK_SECRET — 16–256 символов из A–Z, a–z, 0–9, _ и -")
+		}
+		if maxURL, err := url.Parse(c.maxWebhookURL); err == nil && maxURL.Path == u.Path {
+			return c, errors.New("MAX и Telegram нужны разные пути вебхуков")
+		}
+	}
+	if slices.ContainsFunc(routes, func(r route) bool { return r.reverse }) {
+		u, err := url.Parse(c.maxWebhookURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" ||
+			(u.Port() != "" && u.Port() != "443") {
+			return c, errors.New("MAX_WEBHOOK_URL — публичный HTTPS-адрес вебхука на порту 443 без параметров")
+		}
+		if !validWebhookSecret.MatchString(c.maxSecret) {
+			return c, errors.New("MAX_WEBHOOK_SECRET — 16–256 символов из A–Z, a–z, 0–9, _ и -")
+		}
+	}
 
-	return c, err
+	return c, nil
 }
 
 // loadRoutes takes a single pair from TELEGRAM_CHANNEL and MAX_CHANNEL, or all
@@ -132,13 +260,24 @@ func loadRoutes(path, telegramChannel, maxChannel string) ([]route, error) {
 	if len(file.Routes) == 0 {
 		return nil, fmt.Errorf("%s: в routes нет ни одного маршрута", path)
 	}
+	active := make([]route, 0, len(file.Routes))
 	for i, r := range file.Routes {
+		if r.Enabled != nil && !*r.Enabled {
+			continue
+		}
+		if r.syncDeletes && !r.reverse {
+			return nil, fmt.Errorf("%s: маршрут %d: sync_deletes доступен для источников MAX", path, i+1)
+		}
 		for _, list := range []refs{r.From, r.To} {
 			if len(list) == 0 || slices.ContainsFunc(list, func(ref string) bool { return strings.TrimSpace(ref) == "" }) {
 				return nil, fmt.Errorf("%s: у маршрута %d нужны непустые from и to", path, i+1)
 			}
 		}
+		active = append(active, r)
+	}
+	if len(active) == 0 {
+		return nil, fmt.Errorf("%s: нет включённых маршрутов", path)
 	}
 
-	return file.Routes, nil
+	return active, nil
 }

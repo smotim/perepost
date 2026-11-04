@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -23,12 +24,18 @@ const (
 // heartbeats stop, the bot is down and the monitoring service raises an alarm.
 // The admin is told only when the state changes, not every five minutes.
 type monitor struct {
-	relay     *relay
-	sources   []*source
-	to        []maxChat // every destination once
-	heartbeat string
-	client    *http.Client
-	failing   bool
+	relay         *relay
+	sources       []*source
+	to            []maxChat // every destination once
+	maxSources    []*maxSource
+	db            *store
+	maxWebhookURL string
+	tgWebhookURL  string
+	tgEvents      []string
+	maxEvents     []string
+	heartbeat     string
+	client        *http.Client
+	failing       bool
 }
 
 func (m *monitor) run(ctx context.Context) {
@@ -46,9 +53,37 @@ func (m *monitor) check(ctx context.Context) {
 	checks := make([]func(context.Context) error, 0, len(m.sources)+len(m.to))
 	for _, src := range m.sources {
 		checks = append(checks, func(ctx context.Context) error { return checkTelegramAdmin(ctx, m.relay.tg, src.channel) })
+		if m.db != nil {
+			checks = append(checks, func(ctx context.Context) error {
+				return m.db.checkUncertain(ctx, channelKey{telegramPlatform, src.channel.ID})
+			})
+		}
 	}
 	for _, dst := range m.to {
 		checks = append(checks, func(ctx context.Context) error { return m.relay.max.checkAdmin(ctx, dst) })
+	}
+	if len(m.maxSources) > 0 {
+		checks = append(checks, func(ctx context.Context) error {
+			return m.relay.max.webhook(ctx, m.maxWebhookURL, "", m.maxEvents, false)
+		})
+	}
+	if len(m.sources) > 0 && m.tgWebhookURL != "" {
+		checks = append(checks, func(ctx context.Context) error {
+			return configureTelegramWebhook(ctx, m.relay.tg, m.tgWebhookURL, "", m.tgEvents, false)
+		})
+	}
+	seen := map[int64]bool{}
+	for _, src := range m.maxSources {
+		checks = append(checks, func(ctx context.Context) error { return m.relay.max.checkRead(ctx, src.channel) })
+		checks = append(checks, func(ctx context.Context) error {
+			return m.db.checkUncertain(ctx, channelKey{maxPlatform, src.channel.id})
+		})
+		for _, dst := range src.to {
+			if !seen[dst.ID] {
+				checks = append(checks, func(ctx context.Context) error { return checkTelegramPost(ctx, m.relay.tg, dst) })
+				seen[dst.ID] = true
+			}
+		}
 	}
 	problems := runChecks(ctx, checks, checkParallelism, checkTimeout)
 	if ctx.Err() != nil {
@@ -73,6 +108,16 @@ func (m *monitor) check(ctx context.Context) {
 	if m.heartbeat != "" {
 		m.ping(ctx)
 	}
+}
+
+func (s *store) checkUncertain(ctx context.Context, source channelKey) error {
+	var blocked bool
+	err := s.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM deliveries WHERE destination = ? AND state = 'uncertain')`, source.String()).Scan(&blocked)
+	if err == nil && blocked {
+		err = fmt.Errorf("приём постов %s приостановлен до проверки результата публикации", source)
+	}
+
+	return err
 }
 
 // runChecks runs the checks a few at a time, each with its own timeout, and

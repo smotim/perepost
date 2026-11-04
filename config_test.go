@@ -73,3 +73,24 @@ func TestConfigMistakesAreReported(t *testing.T) {
 		})
 	}
 }
+
+func TestExplicitDirectionsAndDisabledRoutes(t *testing.T) {
+	path := writeConfig(t, `
+routes:
+  - from: "@legacy"
+    to: "-1"
+  - name: max-to-telegram
+    from: {platform: max, channels: [-1, -2]}
+    to: {platform: telegram, channel: "@legacy"}
+  - enabled: false
+    from: {platform: max, channel: "-3"}
+    to: {platform: telegram, channel: "@another"}
+`)
+	routes, err := loadRoutes(path, "", "")
+	if err != nil || len(routes) != 2 {
+		t.Fatalf("routes=%+v, err=%v", routes, err)
+	}
+	if routes[0].reverse || !routes[1].reverse || !slices.Equal(routes[1].From, refs{"-1", "-2"}) {
+		t.Fatalf("unexpected routes: %+v", routes)
+	}
+}

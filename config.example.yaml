@@ -13,3 +13,10 @@ routes:
     to:
       - https://max.ru/my_news
       - https://max.ru/my_digest
+
+  # Встречный маршрут. Требует вебхука MAX и права публикации в Telegram.
+  # - name: max-to-telegram
+  #   from: { platform: max, channel: "-70123456789" }
+  #   to: { platform: telegram, channel: "@my_channel" }
+  #   sync_edits: true
+  #   sync_deletes: true

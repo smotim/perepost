@@ -66,13 +66,33 @@ func (f tgFile) remove() {
 
 // checkWebhook refuses a bot that has a webhook: Telegram does not hand its
 // updates to getUpdates, and deleting the webhook would break whoever set it.
-func checkWebhook(ctx context.Context, tg *bot.Bot) error {
+func configureTelegramWebhook(ctx context.Context, tg *bot.Bot, address, secret string, events []string, configure bool) error {
 	hook, err := tg.GetWebhookInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("не удалось проверить вебхук Telegram-бота: %w", err)
 	}
-	if hook.URL == "" {
+	if hook.URL == address && (!configure || address == "") {
+		if address != "" && !hasEvents(hook.AllowedUpdates, events) {
+			return errors.New("в подписке Telegram отсутствуют нужные события")
+		}
+
 		return nil
+	}
+	if address != "" && configure && (hook.URL == "" || hook.URL == address) {
+		ok, err := tg.SetWebhook(ctx, &bot.SetWebhookParams{
+			URL: address, SecretToken: secret, MaxConnections: 1, AllowedUpdates: events,
+		})
+		if err != nil {
+			return fmt.Errorf("не удалось подключить вебхук Telegram: %w", err)
+		}
+		if !ok {
+			return errors.New("регистрация вебхука отклонена Telegram")
+		}
+
+		return nil
+	}
+	if hook.URL == "" {
+		return errors.New("вебхук Telegram по TELEGRAM_WEBHOOK_URL не зарегистрирован")
 	}
 
 	host := "другой адрес" // not the URL itself: it may contain a token
@@ -112,6 +132,18 @@ func checkTelegramAdmin(ctx context.Context, tg *bot.Bot, chat *models.ChatFullI
 	}
 	if member.Type != models.ChatMemberTypeAdministrator {
 		return fmt.Errorf("бот не администратор канала Telegram «%s»: посты канала Telegram присылает только администраторам", chat.Title)
+	}
+
+	return nil
+}
+
+func checkTelegramPost(ctx context.Context, tg *bot.Bot, chat *models.ChatFullInfo) error {
+	member, err := tg.GetChatMember(ctx, &bot.GetChatMemberParams{ChatID: chat.ID, UserID: tg.ID()})
+	if err != nil {
+		return fmt.Errorf("не удалось проверить право публикации в Telegram «%s»: %w", chat.Title, err)
+	}
+	if member.Administrator == nil || !member.Administrator.CanPostMessages {
+		return fmt.Errorf("боту нужно право публикации в канале Telegram «%s»", chat.Title)
 	}
 
 	return nil

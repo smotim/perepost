@@ -67,7 +67,7 @@ func (f *fake) alerted() []string {
 }
 
 func (f *fake) forward(msgs ...*models.Message) {
-	f.relay.forward(context.Background(), f.source, &post{messages: msgs})
+	f.relay.forward(context.Background(), f.source, &post{messages: msgs}, nil)
 }
 
 func fakes(t *testing.T) *fake {
@@ -139,7 +139,7 @@ func fakes(t *testing.T) *fake {
 			f.mu.Lock()
 			f.sent = append(f.sent, m)
 			f.mu.Unlock()
-			fmt.Fprint(w, `{"message":{}}`)
+			fmt.Fprint(w, `{"message":{"body":{"mid":"mid.test"}}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -156,7 +156,7 @@ func fakes(t *testing.T) *fake {
 	}
 	f.relay = &relay{
 		tg:        tg,
-		max:       &maxClient{api: api, http: maxServer.Client(), token: "max-token"},
+		max:       &maxClient{api: api, http: maxServer.Client(), publish: maxServer.Client(), baseURL: maxServer.URL, token: "max-token"},
 		http:      tgServer.Client(),
 		adminID:   777,
 		fileLimit: tgDownloadLimit,

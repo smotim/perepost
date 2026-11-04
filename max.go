@@ -10,8 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,12 +39,15 @@ func isNumber(s string) bool {
 type maxChat struct {
 	id    int64
 	title string
+	kind  model.ChatType
 }
 
 type maxClient struct {
-	api   *maxbot.Api
-	http  *http.Client
-	token string
+	api     *maxbot.Api
+	http    *http.Client
+	publish *http.Client
+	baseURL string
+	token   string
 }
 
 // russianRootCA is the Russian Trusted Root CA of the Ministry of Digital
@@ -69,6 +75,53 @@ func maxTransport() (*http.Transport, error) {
 	return transport, nil
 }
 
+func maxMediaClient() (*http.Client, error) {
+	transport, err := maxTransport()
+	if err != nil {
+		return nil, err
+	}
+	// Attachment URLs come from posts. Resolve and connect to a public
+	// address ourselves, including after redirects.
+	transport.Proxy = nil
+	transport.DialContext = dialPublicMedia
+
+	return &http.Client{Transport: transport, Timeout: 10 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" || req.URL.User != nil || len(via) >= 5 {
+			return http.ErrUseLastResponse
+		}
+
+		return nil
+	}}, nil
+}
+
+var sharedIPv4 = netip.MustParsePrefix("100.64.0.0/10")
+
+func dialPublicMedia(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: 4 * time.Second}
+	for _, ip := range ips {
+		ip = ip.Unmap()
+		if !ip.IsGlobalUnicast() || ip.IsPrivate() || sharedIPv4.Contains(ip) {
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+
+	return nil, errors.New("не удалось подключиться к публичному адресу вложения MAX")
+}
+
 func newMaxClient(token string) (*maxClient, error) {
 	transport, err := maxTransport()
 	if err != nil {
@@ -84,7 +137,10 @@ func newMaxClient(token string) (*maxClient, error) {
 		return nil, err
 	}
 
-	return &maxClient{api: api, http: client, token: token}, nil
+	return &maxClient{
+		api: api, http: client, token: token, baseURL: "https://" + maxbot.DefaultHostV2,
+		publish: &http.Client{Transport: transport, Timeout: 90 * time.Second, CheckRedirect: noRedirect},
+	}, nil
 }
 
 // retryableStatus turns 429 and 5xx responses into transport errors: the MAX
@@ -127,7 +183,7 @@ func (m *maxClient) resolve(ctx context.Context, ref string) (maxChat, error) {
 		return maxChat{}, fmt.Errorf("канал MAX %q не найден (%w): %s", ref, err, hint)
 	}
 
-	c := maxChat{id: chat.ChatID, title: chat.Title}
+	c := maxChat{id: chat.ChatID, title: chat.Title, kind: chat.Type}
 
 	return c, m.checkAdmin(ctx, c)
 }
@@ -145,9 +201,24 @@ func (m *maxClient) checkAdmin(ctx context.Context, chat maxChat) error {
 	return nil
 }
 
+func (m *maxClient) checkRead(ctx context.Context, chat maxChat) error {
+	if chat.kind != model.ChatTypeChannel {
+		return fmt.Errorf("«%s» — не канал MAX", chat.title)
+	}
+	member, err := m.api.Chats.GetMembership(ctx, chat.id)
+	if err != nil {
+		return fmt.Errorf("не удалось проверить право чтения постов MAX «%s»: %w", chat.title, err)
+	}
+	if !member.IsOwner && (!member.IsAdmin || !slices.Contains(member.Permissions, "read_all_messages")) {
+		return fmt.Errorf("боту нужно право чтения сообщений в канале MAX «%s»", chat.title)
+	}
+
+	return nil
+}
+
 // get calls the MAX API endpoints the client library lacks.
 func (m *maxClient) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+maxbot.DefaultHostV2+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.baseURL+path, nil)
 	if err != nil {
 		return err
 	}
@@ -178,21 +249,60 @@ func (m *maxClient) upload(ctx context.Context, kind model.UploadType, name stri
 	return m.api.Upload.Upload(ctx, kind, r, name, file.size)
 }
 
-func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, notify, preview bool) error {
-	msg := maxbot.NewMessage().SetChat(chatID)
+// The SDK retries its POST even after a lost response. Use one HTTP request
+// here so that only confirmed rejections can be retried by the delivery book.
+func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, notify, preview bool) ([]string, error) {
+	msg := model.NewMessageBody{Text: html, Attachments: make([]model.Attachment, 0, len(attachments))}
 	if html != "" {
-		msg.SetText(html).SetFormat(model.FormatHTML)
+		msg.Format = model.FormatHTML
 	}
 	for _, a := range attachments {
-		msg.AddAttachByToken(a.token, a.kind)
+		msg.Attachments = append(msg.Attachments, model.Attachment{Type: a.kind, Payload: model.Payload{Token: a.token}})
 	}
 	if !notify {
-		msg.WithoutNotify()
+		msg.Notify = &notify
 	}
+	query := url.Values{"chat_id": {strconv.FormatInt(chatID, 10)}}
 	if !preview {
-		msg.SetDisableLinkPreview(true)
+		query.Set("disable_link_preview", "true")
 	}
-	_, err := m.api.Messages.Send(ctx, msg)
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return nil, &publishError{message: err.Error()}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+"/messages?"+query.Encode(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, &publishError{message: "не удалось собрать запрос публикации в MAX"}
+	}
+	req.Header.Set(maxbot.AuthorizationHeader, m.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.publish.Do(req)
+	if err != nil {
+		return nil, withoutURL(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		var apiErr maxbot.Error
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 32<<10)).Decode(&apiErr)
+		message := fmt.Sprintf("MAX ответил %s: %s", resp.Status, apiErr.Error())
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests:
+			return nil, &publishError{message, rateLimitDelay(resp.Header.Get("Retry-After"))}
+		case definitivelyRejected(resp.StatusCode) && apiErr.IsAttachmentNotReady():
+			return nil, &publishError{message, 2 * time.Second}
+		case definitivelyRejected(resp.StatusCode):
+			return nil, &publishError{message: message}
+		default:
+			return nil, errors.New(message)
+		}
+	}
+	var result model.SendMessageResult
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("ответ публикации MAX: %w", err)
+	}
+	if result.Message.Body.Mid == "" {
+		return nil, errors.New("MAX не вернул mid")
+	}
 
-	return err
+	return []string{result.Message.Body.Mid}, nil
 }
