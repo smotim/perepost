@@ -1,22 +1,15 @@
-# Маршруты: каждый пост любого канала из from уходит во все каналы из to.
-# Канал — ссылка, @имя или числовой id (для закрытых каналов). В from и to
-# можно указать один канал или список. Токены сюда не пишутся — они в .env.
+# Каждый пост любого канала из from уходит во все каналы из to.
+# Для нескольких каналов используйте channels: [...] вместо channel.
+# Токены и параметры вебхука MAX задаются в .env.
 routes:
-  # Один канал в один
-  - from: https://t.me/my_channel
-    to: https://max.ru/my_channel
+  - name: telegram-to-max
+    from: { platform: telegram, channel: "@my_channel" }
+    to: { platform: max, channel: "-70123456789" }
+    sync_edits: true
 
-  # Несколько каналов в несколько
-  - from:
-      - https://t.me/my_news
-      - "-1001234567890"
-    to:
-      - https://max.ru/my_news
-      - https://max.ru/my_digest
-
-  # Встречный маршрут. Требует вебхука MAX и права публикации в Telegram.
-  # - name: max-to-telegram
-  #   from: { platform: max, channel: "-70123456789" }
-  #   to: { platform: telegram, channel: "@my_channel" }
-  #   sync_edits: true
-  #   sync_deletes: true
+  # Требует вебхука MAX и права публикации в Telegram.
+  - name: max-to-telegram
+    from: { platform: max, channel: "-70123456789" }
+    to: { platform: telegram, channel: "@my_channel" }
+    sync_edits: true
+    # sync_deletes: true
