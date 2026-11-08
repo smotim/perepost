@@ -225,6 +225,17 @@ docker compose up -d perepost
 запускайте один экземпляр perepost. Для фиксации версии укажите, например,
 `ghcr.io/smotim/perepost:0.3.0`. Образы и бинарники доступны для Linux amd64 и arm64.
 
+### Проверка происхождения сборки
+
+Начиная со следующего релиза, у каждого архива и образа есть подписанная attestation: она
+подтверждает, что файл собран workflow `release` этого репозитория из указанного тега.
+Проверка через [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify perepost_*_linux_amd64.tar.gz --repo smotim/perepost
+gh attestation verify oci://ghcr.io/smotim/perepost:<версия> --repo smotim/perepost
+```
+
 ## Запуск без Docker
 
 Скачайте архив для своей архитектуры из [Releases](https://github.com/smotim/perepost/releases).
