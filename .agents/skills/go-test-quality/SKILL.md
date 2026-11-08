@@ -1,0 +1,243 @@
+---
+name: go-test-quality
+description: >
+  Go testing patterns for production-grade code: subtests, test helpers,
+  fixtures, golden files, httptest, testcontainers, fuzz testing, and
+  testing/synctest. Covers mocking strategies, test isolation, coverage
+  analysis, and test design philosophy. Use when writing tests, improving
+  coverage, reviewing test quality, setting up test infrastructure, or
+  choosing a testing approach. Trigger examples: "add tests", "improve
+  coverage", "write tests for this", "test helpers", "mock this dependency",
+  "integration test", "fuzz test", "flaky test", "synctest", "goroutine leak
+  in tests".
+  Not for: benchmarking methodology (go-performance-review), security
+  testing (go-security-audit), table-driven patterns (go-test-table-driven).
+user-invocable: true
+license: MIT
+compatibility: Designed for Claude Code or similar AI coding agents working on Go projects. Requires the Go toolchain. Container-based integration tests require Docker.
+metadata:
+  author: eduardo-sl
+  version: "1.5.1"
+---
+
+# Go Test Quality
+
+Tests are production code. They run in CI on every commit, they document behavior,
+and they're the first thing you read when a function breaks at 3am.
+Write them with the same care you'd give to code that handles money.
+
+> Community default. A project skill or agent-config rule that explicitly
+> supersedes `go-test-quality` takes precedence over this one.
+
+Detailed reference material, loaded on demand:
+
+- `references/helpers-and-fixtures.md` — test helpers, factory functions
+  with options, `t.Cleanup`, golden files, mock implementations.
+- `references/integration-testing.md` — httptest recorder and server,
+  testcontainers, build tags, `TestMain`, fuzz testing.
+- `references/concurrency-and-benchmarks.md` — `synctest`, `goleak`,
+  `t.Context()`, `b.Loop()` benchmarks, `t.Attr` and artifacts.
+
+Read a reference file only when the summary below is not enough.
+
+## 1. Test Design Philosophy
+
+### Test behavior, not implementation
+
+```go
+// ✅ Good — tests what the function DOES
+func TestTransferFunds_InsufficientBalance(t *testing.T) {
+    from := NewAccount("alice", 100)
+    to := NewAccount("bob", 0)
+
+    err := TransferFunds(from, to, 150)
+
+    require.ErrorIs(t, err, ErrInsufficientFunds)
+    assert.Equal(t, 100, from.Balance(), "sender balance should be unchanged")
+    assert.Equal(t, 0, to.Balance(), "receiver balance should be unchanged")
+}
+
+// ❌ Bad — tests HOW the function does it
+// asserts debit() was called before credit(), rollback() was called,
+// internal mutex was locked — breaks on every refactor
+```
+
+### One assertion per logical concept
+
+Multiple `assert` calls are fine when they verify different facets of the
+SAME behavior (both accounts after a transfer). A test that checks creation
+AND update AND deletion is three tests pretending to be one.
+
+### Name tests like bug reports
+
+When the test fails, the name alone should say what broke:
+
+```go
+// ✅ Good — reads like a sentence
+func TestOrderService_Cancel_RefundsPartiallyShippedItems(t *testing.T) { ... }
+func TestParseConfig_ReturnsErrorOnMissingRequiredField(t *testing.T) { ... }
+
+// ❌ Bad — says nothing useful
+func TestCancel(t *testing.T) { ... }
+func TestRateLimiter_Success(t *testing.T) { ... }
+```
+
+### Layout
+
+- One `_test.go` per source file (`parser.go` → `parser_test.go`), tests
+  in the order of the functions they cover — tools and reviewers navigate
+  by file.
+- Public-API tests live in the `pkg_test` package so they can only use
+  what callers can; white-box tests stay in `pkg`.
+- Integration tests sit behind `//go:build integration`.
+
+## 2. Subtests for Organized Scenarios
+
+Use `t.Run` to group related scenarios under a parent test. Each subtest
+gets its own setup, its own failure, and its own name in CI output:
+
+```go
+func TestUserService_Create(t *testing.T) {
+    svc := setupUserService(t)
+
+    t.Run("succeeds with valid input", func(t *testing.T) {
+        user, err := svc.Create(ctx, CreateUserInput{Name: "Alice", Email: "alice@example.com"})
+        require.NoError(t, err)
+        assert.NotEmpty(t, user.ID)
+    })
+
+    t.Run("rejects duplicate email", func(t *testing.T) {
+        _, _ = svc.Create(ctx, CreateUserInput{Name: "Alice", Email: "taken@example.com"})
+        _, err := svc.Create(ctx, CreateUserInput{Name: "Bob", Email: "taken@example.com"})
+        require.ErrorIs(t, err, ErrDuplicateEmail)
+    })
+}
+```
+
+## 3. Test Helper Rules
+
+1. **Always call `t.Helper()`** in test utilities so failures point to the
+   caller, not the helper.
+2. **Factory functions with functional options** for complex test objects —
+   defaults with per-test overrides, never a 15-parameter constructor.
+3. **Prefer `t.Cleanup` over `defer`** — it runs even after `t.FailNow()`
+   and is scoped to the test, not the function.
+
+Full implementations in `references/helpers-and-fixtures.md`.
+
+## 4. Choosing the Test Type
+
+| Situation | Approach | Details |
+|---|---|---|
+| Pure function, 3+ data cases | Table-driven test | go-test-table-driven skill |
+| HTTP handler in isolation | `httptest.NewRecorder` + mock store | `references/integration-testing.md` |
+| Full routing/middleware stack | `httptest.NewServer` | `references/integration-testing.md` |
+| Real database behavior | testcontainers + build tags | `references/integration-testing.md` |
+| Complex output (JSON, HTML, SQL) | Golden files in `testdata/` | `references/helpers-and-fixtures.md` |
+| Parser/validator on untrusted input | Fuzz test | `references/integration-testing.md` |
+
+## 5. Mocking Rules
+
+- **Interface-based hand-written mocks** for small interfaces (≤3 methods):
+  a struct with function fields plus recorded calls.
+- **Function injection** for simple seams (`now func() time.Time`).
+- **Do NOT mock:** value objects, pure functions, the standard library, or
+  your own code in the same package. Test the real thing.
+- If you mock everything, you're testing your mocks, not your code.
+
+## 6. Parallelism and Coverage
+
+```go
+func TestSlugify(t *testing.T) {
+    t.Parallel() // safe: pure function, no shared state
+    // ...
+}
+```
+
+Do NOT use `t.Parallel()` when tests share mutable state, databases,
+files, or process-level state — `t.Setenv` and `t.Chdir` panic in a
+parallel test for exactly that reason.
+
+```bash
+go test -race -coverprofile=coverage.out -coverpkg=./... ./...
+go tool cover -html=coverage.out   # read the red lines, not the percentage
+```
+
+Coverage finds untested code; it does not measure whether the assertions
+are any good. Use it to locate gaps, and let CI enforce a floor that only
+ratchets up (the go-ci skill owns the gate). Without `-coverpkg`, a
+package exercised only by another package's tests reports 0%.
+
+## 7. Testing Concurrent Code
+
+- Never synchronise a test with `time.Sleep` — it is slow when it works and
+  flaky when it does not.
+- Go 1.25+: run time-dependent code inside `synctest.Test`. The bubble's
+  fake clock advances instantly once every goroutine is blocked, and
+  `synctest.Wait()` replaces "sleep until the background goroutine gets
+  there". On Go 1.24 the API is `synctest.Run` behind
+  `GOEXPERIMENT=synctest`. Go 1.27 adds `synctest.Sleep(d)` (advance and
+  settle in one call) and `httptest.NewTestServer(t, h)`, an in-memory
+  server that works inside the bubble and closes itself.
+- Any package that starts goroutines verifies none leak:
+  `goleak.VerifyTestMain(m)` in `TestMain`, or `defer goleak.VerifyNone(t)`.
+  `-race` finds data races; it does not find a goroutine that never exits.
+
+## 8. Test Context, Benchmarks, and Artifacts
+
+- `t.Context()` (Go 1.24+) instead of `context.Background()` — it is
+  cancelled before `t.Cleanup` runs, so blocked work unwinds when the test
+  ends.
+- Benchmarks use `for b.Loop()` (Go 1.24+): setup runs once, results stay
+  alive without a sink. Add `b.ReportAllocs()` and compare runs with
+  `benchstat`.
+- `t.Attr` (Go 1.25+) emits key/value pairs CI can parse;
+  `t.ArtifactDir()` with `go test -artifacts` (Go 1.26+) keeps failing
+  golden output or captured bodies outside the repository.
+
+Examples for both sections: `references/concurrency-and-benchmarks.md`.
+
+## 9. Assertion Library Traps
+
+- **Build `assert.New(t)` / `require.New(t)` inside each `t.Run`.** An
+  instance created from the parent `t` reports a subtest's failure against
+  the parent, and the failing subtest itself prints `PASS`.
+- **`require`, `t.Fatal` and `t.FailNow` only on the test goroutine.**
+  From a spawned goroutine they cannot stop the test. Send results back on
+  a channel and assert after receiving. `go vet`'s `testinggoroutine` and
+  golangci-lint's `testifylint` catch most cases.
+- **`require` for preconditions, `assert` for independent checks** — a
+  failed precondition should stop the test before it nil-panics.
+- **`assert.Eventually` hides timing bugs** in polling; prefer `synctest`.
+
+## Anti-Patterns
+
+- 🔴 Test with no assertions — always passes, proves nothing
+- 🔴 `time.Sleep` for synchronization — use `testing/synctest`, channels, or polling
+- 🔴 Test depends on execution order — each test must stand alone
+- 🔴 Mocking everything — you end up testing your mocks, not your code
+- 🟡 Test names like `Test1`, `TestSuccess` — name the scenario
+- 🟡 Reaching into private fields — test through the public API
+- 🟡 No edge cases: empty, nil, zero, max values, unicode
+- 🟡 Giant shared setup — each test should set up only what it needs
+- 🟡 `context.Background()` in a test — use `t.Context()`
+- 🟡 `for range b.N` on Go 1.24+ — use `for b.Loop()`
+- 🟢 Fuzz anything that takes untrusted input
+- 🟢 Golden files for complex output comparisons
+
+## Verification Checklist
+
+1. Every test has meaningful assertions (no empty test bodies)
+2. Test names describe the scenario, not the method
+3. `t.Helper()` called in every test utility function
+4. `t.Cleanup()` used for resource teardown
+5. `t.Parallel()` used where safe, avoided where not
+6. Integration tests guarded with `testing.Short()` or build tags
+7. Mocks are minimal — only mock external dependencies
+8. No `time.Sleep` for synchronization anywhere in the suite
+9. Packages that start goroutines verify with `goleak`
+10. Benchmarks use `for b.Loop()` and call `b.ReportAllocs()`
+11. Edge cases covered: empty, nil, zero, boundary values
+12. `go test -race ./...` passes
+13. Coverage is used to find gaps; CI enforces a ratcheting floor, not a target
+14. testify instances are built per subtest; no `require` off the test goroutine
