@@ -69,16 +69,6 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 	msgs := slices.SortedFunc(slices.Values(p.messages), func(a, b *models.Message) int { return a.ID - b.ID })
 	ref := src.postRef(msgs[0].ID)
 	log := slog.With("channel", src.channel.Title, "post", msgs[0].ID)
-	defer func() {
-		if v := recover(); v != nil {
-			log.Error("сбой при пересылке", "panic", v)
-			_ = r.alert(fmt.Sprintf("сбой при пересылке поста %s: %v", ref, v))
-			if book != nil {
-				// A publication may be in flight. Startup recovers its journal state.
-				book.err = fmt.Errorf("обработка поста %s прервана: %v", ref, v)
-			}
-		}
-	}()
 
 	var (
 		files    []media
@@ -112,18 +102,21 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 
 			continue
 		}
-		for i, dst := range src.to {
-			a, err := r.upload(ctx, md, file)
-			if err != nil {
-				log.Error("вложение не загружено в MAX", "file", md.name, "to", dst.title, "err", err)
-				problems = append(problems, fmt.Sprintf("%s → «%s»: %v", md.name, dst.title, err))
-				uploaded[i].failed = true
+		// A closure, so the file is removed even when an upload panics.
+		func() {
+			defer file.remove()
+			for i, dst := range src.to {
+				a, err := r.upload(ctx, md, file)
+				if err != nil {
+					log.Error("вложение не загружено в MAX", "file", md.name, "to", dst.title, "err", err)
+					problems = append(problems, fmt.Sprintf("%s → «%s»: %v", md.name, dst.title, err))
+					uploaded[i].failed = true
 
-				continue
+					continue
+				}
+				uploaded[i].add(a)
 			}
-			uploaded[i].add(a)
-		}
-		file.remove()
+		}()
 	}
 
 	for i, dst := range src.to {

@@ -110,6 +110,12 @@ func openStore(ctx context.Context, path string) (*store, error) {
 			seq INTEGER NOT NULL,
 			PRIMARY KEY (source, mid)
 		);
+		CREATE TABLE IF NOT EXISTS failures (
+			source TEXT NOT NULL,
+			post TEXT NOT NULL,
+			count INTEGER NOT NULL,
+			PRIMARY KEY (source, post)
+		);
 		UPDATE deliveries SET state = 'uncertain' WHERE state = 'sending';
 		UPDATE deliveries SET state = 'failed' WHERE state = 'partial';
 	`)
@@ -188,10 +194,44 @@ func (s *store) next(ctx context.Context, source channelKey, now time.Time) (pen
 }
 
 func (s *store) complete(ctx context.Context, source channelKey, p pendingPost) error {
-	_, err := s.ExecContext(ctx, `UPDATE inbox SET payload = NULL WHERE source = ? AND post = ? AND rowid <= ?`,
-		source.String(), p.key, p.row)
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE inbox SET payload = NULL WHERE source = ? AND post = ? AND rowid <= ?`,
+		source.String(), p.key, p.row); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM failures WHERE source = ? AND post = ?`, source.String(), p.key); err != nil {
+		return err
+	}
 
-	return err
+	return tx.Commit()
+}
+
+// recordFailure counts a crash while processing a post. The count survives the
+// restart that follows, so a post that crashes every time is eventually skipped
+// instead of restarting the service forever.
+func (s *store) recordFailure(ctx context.Context, source channelKey, post string) (int, error) {
+	var count int
+	err := s.QueryRowContext(ctx, `
+		INSERT INTO failures(source, post, count) VALUES (?, ?, 1)
+		ON CONFLICT (source, post) DO UPDATE SET count = count + 1
+		RETURNING count
+	`, source.String(), post).Scan(&count)
+
+	return count, err
+}
+
+func (s *store) failures(ctx context.Context, source channelKey, post string) (int, error) {
+	var count int
+	err := s.QueryRowContext(ctx, `SELECT count FROM failures WHERE source = ? AND post = ?`, source.String(), post).Scan(&count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+
+	return count, err
 }
 
 type deliveryBook struct {

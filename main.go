@@ -38,6 +38,8 @@ const (
 	shutdownGrace = 50 * time.Second
 	// setupTimeout bounds resolving every channel at startup.
 	setupTimeout = 5 * time.Minute
+	// maxPostFailures is how many crashes in a row a post gets before it is skipped.
+	maxPostFailures = 3
 )
 
 func main() {
@@ -200,7 +202,7 @@ func run() error {
 	for _, src := range list {
 		workers.Go(func() {
 			key := channelKey{telegramPlatform, src.channel.ID}
-			fail(process(sending, db, key, intakeDone, func(p pendingPost, book *deliveryBook) {
+			fail(process(sending, db, key, intakeDone, r.alert, func(p pendingPost, book *deliveryBook) {
 				if strings.HasPrefix(p.key, "change:") {
 					r.editFromTelegram(sending, src, p, book)
 
@@ -224,7 +226,7 @@ func run() error {
 	for _, src := range maxList {
 		workers.Go(func() {
 			key := channelKey{maxPlatform, src.channel.id}
-			fail(process(sending, db, key, intakeDone, func(p pendingPost, book *deliveryBook) {
+			fail(process(sending, db, key, intakeDone, r.alert, func(p pendingPost, book *deliveryBook) {
 				if strings.HasPrefix(p.key, "change:") {
 					r.changeFromMax(sending, src, p, book)
 
@@ -293,7 +295,10 @@ func run() error {
 	return failure
 }
 
-func process(ctx context.Context, db *store, source channelKey, intakeDone <-chan struct{}, forward func(pendingPost, *deliveryBook)) error {
+// process delivers the posts of one source in order. A crash while handling a
+// post stops the service, so the restart turns its in-flight publications into
+// uncertain ones; after maxPostFailures crashes in a row the post is skipped.
+func process(ctx context.Context, db *store, source channelKey, intakeDone <-chan struct{}, alert func(string) error, forward func(pendingPost, *deliveryBook)) error {
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for ctx.Err() == nil {
@@ -314,8 +319,23 @@ func process(ctx context.Context, db *store, source channelKey, intakeDone <-cha
 			return err
 		}
 		if post.row != 0 {
+			failures, err := db.failures(ctx, source, post.key)
+			if err != nil {
+				return err
+			}
+			if failures >= maxPostFailures {
+				slog.Error("пост пропущен после повторных сбоев", "channel", source, "post", post.key, "failures", failures)
+				_ = alert(fmt.Sprintf("пост %s из %s пропущен: обработка падала %d раза подряд", post.key, source, failures))
+				if err := db.complete(ctx, source, post); err != nil {
+					return err
+				}
+
+				continue
+			}
 			book := &deliveryBook{store: db, source: source, post: post.key}
-			forward(post, book)
+			if crash := handle(forward, post, book); crash != nil {
+				return crashed(ctx, db, source, post.key, crash, alert)
+			}
 			if ctx.Err() != nil {
 				break
 			}
@@ -339,6 +359,41 @@ func process(ctx context.Context, db *store, source channelKey, intakeDone <-cha
 	}
 
 	return nil
+}
+
+// crash is a panic caught while handling a post, with the stack it came from.
+type crash struct {
+	value any
+	stack []byte
+}
+
+// handle runs forward and turns a panic into a crash: every handler, in both
+// directions, gets the same treatment.
+func handle(forward func(pendingPost, *deliveryBook), p pendingPost, book *deliveryBook) (c *crash) {
+	defer func() {
+		if v := recover(); v != nil {
+			c = &crash{v, debug.Stack()}
+		}
+	}()
+	forward(p, book)
+
+	return nil
+}
+
+// crashed counts the crash, tells the admin and returns the error that stops the service.
+func crashed(ctx context.Context, db *store, source channelKey, post string, c *crash, alert func(string) error) error {
+	slog.Error("сбой при обработке поста", "channel", source, "post", post, "panic", c.value, "stack", string(c.stack))
+	// Shutdown may already be cancelling ctx; the count must still be saved.
+	saving, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	count, err := db.recordFailure(saving, source, post)
+	if err != nil {
+		slog.Error("не удалось записать сбой поста", "channel", source, "post", post, "err", err)
+	}
+	_ = alert(fmt.Sprintf("сбой при обработке поста %s из %s (%d из %d, затем пост будет пропущен): %v",
+		post, source, count, maxPostFailures, c.value))
+
+	return fmt.Errorf("обработка поста %s из %s прервана: %v", post, source, c.value)
 }
 
 func resolveDelivery(args []string) error {

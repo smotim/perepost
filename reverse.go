@@ -162,7 +162,9 @@ func (r *relay) forwardMax(ctx context.Context, src *maxSource, message maxMessa
 		if errors.Is(err, errMaxMediaExpired) && message.Body.Mid != "" && i < len(message.Body.Attachments) {
 			if !refreshTried {
 				refreshTried = true
-				_ = r.max.get(ctx, "/messages/"+url.PathEscape(message.Body.Mid), &refreshed)
+				if err := r.max.get(ctx, "/messages/"+url.PathEscape(message.Body.Mid), &refreshed); err != nil {
+					log.Warn("не удалось обновить ссылки на вложения MAX", "err", err)
+				}
 			}
 			for j, fresh := range refreshed.Body.Attachments {
 				if fresh.Type == a.Type && ((a.Payload.Token != "" && fresh.Payload.Token == a.Payload.Token) || (a.Payload.Token == "" && i == j)) {
@@ -220,11 +222,14 @@ func (r *relay) downloadMax(ctx context.Context, a maxMedia, limit int64) (maxFi
 	address := a.Payload.URL
 	if a.Type == model.AttachVideo && a.Payload.Token != "" {
 		var details model.VideoAttachmentDetails
-		_ = retry(ctx, func() (err error) {
+		// Without the details the video falls back to the URL from the message.
+		if err := retry(ctx, func() (err error) {
 			details, err = r.max.api.Messages.GetVideoAttachmentDetails(ctx, a.Payload.Token)
 
 			return err
-		})
+		}); err != nil {
+			slog.Warn("не удалось получить ссылки на видео MAX", "err", err)
+		}
 		if u := details.Urls; u != nil {
 			for _, mp4 := range []*string{u.Mp41080, u.Mp4720, u.Mp4480, u.Mp4360, u.Mp4240, u.Mp4144} {
 				if mp4 != nil && *mp4 != "" {
