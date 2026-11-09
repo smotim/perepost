@@ -69,26 +69,30 @@ func (t richText) tags(e models.MessageEntity) (open, close string, ok bool) {
 		return "<code>", "</code>", true
 	case models.MessageEntityTypeBlockquote, models.MessageEntityTypeExpandableBlockquote:
 		return "<blockquote>", "</blockquote>", true
-	case models.MessageEntityTypeTextLink:
-		if e.URL == "" {
+	case models.MessageEntityTypeTextLink, models.MessageEntityTypeURL:
+		href := t.linkURL(e)
+		if href == "" {
 			return "", "", false
-		}
-
-		return `<a href="` + attrEscaper.Replace(e.URL) + `">`, "</a>", true
-	case models.MessageEntityTypeURL:
-		if e.Offset < 0 || e.Offset+e.Length > len(t.units) {
-			return "", "", false
-		}
-		// A bare link in the text: wrap it so that it is a link in MAX as well
-		href := string(utf16.Decode(t.units[e.Offset : e.Offset+e.Length]))
-		if !strings.Contains(href, "://") {
-			href = "https://" + href
 		}
 
 		return `<a href="` + attrEscaper.Replace(href) + `">`, "</a>", true
 	}
 
 	return "", "", false
+}
+
+func (t richText) linkURL(e models.MessageEntity) string {
+	if e.Type == models.MessageEntityTypeTextLink {
+		return e.URL
+	}
+	if e.Type != models.MessageEntityTypeURL || e.Offset < 0 || e.Length <= 0 || e.Offset > len(t.units) || e.Length > len(t.units)-e.Offset {
+		return ""
+	}
+	href := string(utf16.Decode(t.units[e.Offset : e.Offset+e.Length]))
+	if !strings.Contains(href, "://") {
+		href = "https://" + href
+	}
+	return href
 }
 
 var (
@@ -186,7 +190,7 @@ func (t richText) split(limit int) []string {
 	var addresses []string
 	for _, e := range t.entities {
 		open, close, ok := t.tags(e)
-		if ok && (htmlLen(open+close)+5 > limit || (e.Type == models.MessageEntityTypeTextLink && htmlLen(e.URL) > 2048)) {
+		if ok && (htmlLen(open+close)+5 > limit || htmlLen(t.linkURL(e)) > 2048) {
 			if e.Type == models.MessageEntityTypeTextLink && !slices.Contains(addresses, e.URL) {
 				addresses = append(addresses, e.URL)
 			}

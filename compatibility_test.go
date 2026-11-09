@@ -99,3 +99,12 @@ func TestNestedMarkupCannotProduceOversizedPart(t *testing.T) {
 		t.Fatal("split mutated the original entities")
 	}
 }
+
+func TestLongBareURLDoesNotCreateInvalidMaxAnchor(t *testing.T) {
+	address := "https://example.org/" + strings.Repeat("x", 2500)
+	text := newRichText(address, []models.MessageEntity{{Type: models.MessageEntityTypeURL, Length: len(address)}})
+	parts := text.split(maxTextLimit)
+	if len(parts) != 1 || parts[0] != address {
+		t.Fatalf("long bare URL changed or wrapped in an invalid anchor: %q", parts)
+	}
+}
