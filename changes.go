@@ -159,7 +159,7 @@ func (r *relay) editFromTelegram(ctx context.Context, src *source, p pendingPost
 			return r.max.deleteMirror(ctx, part.id)
 		}, func(part string, publish publish) error {
 			return publish(ctx, func() ([]string, error) {
-				return retryPublish(ctx, func() ([]string, error) { return r.max.send(ctx, dst.id, part, nil, false, preview) })
+				return retryPublish(ctx, func() ([]string, error) { return r.max.send(ctx, dst.id, part, nil, preview) })
 			}, mirrorText)
 		})
 		r.changeError(book, dst.title, err)

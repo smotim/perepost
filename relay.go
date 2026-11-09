@@ -148,9 +148,9 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 }
 
 // send posts a message set to a MAX channel: attachments with the start of the
-// text first, then the rest of the text, then the files one per message. Only
-// the first message notifies subscribers, as a single post would. It returns
-// how many messages went out.
+// text first, then the rest of the text, then the files one per message.
+// MAX channels notify subscribers for every part. It returns how many
+// messages went out.
 func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads, preview bool, publish publish) (int, error) {
 	first, files := u.visual, u.files
 	if len(first) == 0 && len(files) > 0 {
@@ -186,7 +186,7 @@ func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads
 		}
 		err := publish(ctx, func() ([]string, error) {
 			return retryPublish(ctx, func() ([]string, error) {
-				return r.max.send(ctx, dst.id, msg.text, msg.attachments, i == 0, preview)
+				return r.max.send(ctx, dst.id, msg.text, msg.attachments, preview)
 			})
 		}, kind)
 		if err != nil {

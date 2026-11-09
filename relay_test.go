@@ -136,6 +136,13 @@ func fakes(t *testing.T) *fake {
 			if err := json.NewDecoder(r.Body).Decode(&m.body); err != nil {
 				t.Errorf("message body: %v", err)
 			}
+			// MAX channels reject silent messages, including continuation parts.
+			if m.body.Notify != nil && !*m.body.Notify {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"code":"proto.payload","message":"errors.send-message.channel-notify"}`)
+
+				return
+			}
 			f.mu.Lock()
 			f.sent = append(f.sent, m)
 			f.mu.Unlock()
@@ -194,7 +201,7 @@ func TestAlbumGoesAsOneMessageWithCaption(t *testing.T) {
 	}
 }
 
-func TestFilesGoSeparatelyAndOnlyFirstMessageNotifies(t *testing.T) {
+func TestFilesGoSeparatelyWithChannelNotifications(t *testing.T) {
 	f := fakes(t)
 	f.forward(
 		&models.Message{ID: 1, MediaGroupID: "d", Document: &models.Document{FileID: "d1", FileName: "a.pdf"}, Caption: "Программа"},
@@ -208,8 +215,27 @@ func TestFilesGoSeparatelyAndOnlyFirstMessageNotifies(t *testing.T) {
 	if got[0].body.Text != "Программа" || len(got[0].body.Attachments) != 1 || got[0].body.Notify != nil {
 		t.Fatalf("first message: %+v", got[0].body)
 	}
-	if got[1].body.Text != "" || len(got[1].body.Attachments) != 1 || got[1].body.Notify == nil || *got[1].body.Notify {
+	if got[1].body.Text != "" || len(got[1].body.Attachments) != 1 || got[1].body.Notify != nil {
 		t.Fatalf("second message: %+v", got[1].body)
+	}
+}
+
+func TestLongPostSendsEveryPartWithChannelNotifications(t *testing.T) {
+	f := fakes(t)
+	paragraph := strings.Repeat("я", 2000)
+	f.forward(&models.Message{ID: 1, Text: strings.Join([]string{paragraph, paragraph, paragraph}, "\n\n")})
+
+	got := f.messages()
+	if len(got) != 3 {
+		t.Fatalf("want 3 messages, got %d; alerts: %v", len(got), f.alerted())
+	}
+	for i, msg := range got {
+		if msg.body.Text != paragraph || msg.body.Notify != nil {
+			t.Fatalf("part %d: %+v", i+1, msg.body)
+		}
+	}
+	if alerts := f.alerted(); len(alerts) != 0 {
+		t.Fatalf("alerts: %v", alerts)
 	}
 }
 

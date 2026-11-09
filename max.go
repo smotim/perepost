@@ -251,7 +251,7 @@ func (m *maxClient) upload(ctx context.Context, kind model.UploadType, name stri
 
 // The SDK retries its POST even after a lost response. Use one HTTP request
 // here so that only confirmed rejections can be retried by the delivery book.
-func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, notify, preview bool) ([]string, error) {
+func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, preview bool) ([]string, error) {
 	msg := model.NewMessageBody{Text: html, Attachments: make([]model.Attachment, 0, len(attachments))}
 	if html != "" {
 		msg.Format = model.FormatHTML
@@ -259,9 +259,8 @@ func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachm
 	for _, a := range attachments {
 		msg.Attachments = append(msg.Attachments, model.Attachment{Type: a.kind, Payload: model.Payload{Token: a.token}})
 	}
-	if !notify {
-		msg.Notify = &notify
-	}
+	// MAX channels require notifications: notify=false rejects the message.
+	// Leave notify unset to use the platform default for every part.
 	query := url.Values{"chat_id": {strconv.FormatInt(chatID, 10)}}
 	if !preview {
 		query.Set("disable_link_preview", "true")

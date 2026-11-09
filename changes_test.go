@@ -88,6 +88,18 @@ func TestTelegramWebhookEditsSplitCopyInPlaceOnlyForEnabledPair(t *testing.T) {
 			}
 			fmt.Fprint(w, `{"success":true}`)
 		case http.MethodPost:
+			var payload struct {
+				Notify *bool `json:"notify"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			if payload.Notify != nil && !*payload.Notify {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"code":"proto.payload","message":"errors.send-message.channel-notify"}`)
+
+				return
+			}
 			calls = append(calls, "add:"+req.URL.Query().Get("chat_id"))
 			fmt.Fprint(w, `{"message":{"body":{"mid":"mid.extra"}}}`)
 		case http.MethodDelete:
