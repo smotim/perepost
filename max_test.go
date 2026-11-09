@@ -1,11 +1,38 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 )
+
+func TestPublicMediaDialReportsWhenNoPublicAddressExists(t *testing.T) {
+	conn, err := dialPublicMedia(t.Context(), "tcp", "127.0.0.1:443")
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("private address must not be dialed")
+	}
+	if err == nil || !strings.Contains(err.Error(), "нет публичного адреса") {
+		t.Fatalf("missing public-address diagnosis: %v", err)
+	}
+}
+
+func TestPublicMediaDialPreservesCancellationCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	conn, err := dialPublicMedia(ctx, "tcp", "1.1.1.1:443")
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("cancelled dial must not connect")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial cancellation cause lost: %v", err)
+	}
+}
 
 func TestEmbeddedRootVerifiesTheMaxChain(t *testing.T) {
 	transport, err := maxTransport()

@@ -104,6 +104,8 @@ func maxWebhook(secret string, db *store, sources map[int64]*maxSource) http.Han
 			MessageID string          `json:"message_id"`
 		}
 		if err := json.Unmarshal(payload, &update); err != nil {
+			slog.Warn("не удалось разобрать событие MAX", "type", update.Type, "err", err)
+
 			return errInvalidUpdate
 		}
 		if update.Type == maxDelete {
@@ -117,10 +119,16 @@ func maxWebhook(secret string, db *store, sources map[int64]*maxSource) http.Han
 			return nil
 		}
 		var head struct {
-			Recipient model.Recipient      `json:"recipient"`
-			Body      struct{ Mid string } `json:"body"`
+			Recipient struct {
+				ChatID   int64           `json:"chat_id"`
+				ChatType model.ChatType  `json:"chat_type"`
+				PostID   json.RawMessage `json:"post_id"`
+			} `json:"recipient"`
+			Body struct{ Mid string } `json:"body"`
 		}
 		if err := json.Unmarshal(update.Message, &head); err != nil {
+			slog.Warn("не удалось разобрать заголовок поста MAX", "type", update.Type, "err", err)
+
 			return errInvalidUpdate
 		}
 		id := head.Recipient.ChatID
@@ -129,8 +137,16 @@ func maxWebhook(secret string, db *store, sources map[int64]*maxSource) http.Han
 			return nil
 		}
 		mid := head.Body.Mid
-		if mid == "" {
-			mid = head.Recipient.PostID
+		if mid == "" && len(head.Recipient.PostID) > 0 {
+			if err := json.Unmarshal(head.Recipient.PostID, &mid); err != nil {
+				var number json.Number
+				if err := json.Unmarshal(head.Recipient.PostID, &number); err != nil {
+					slog.Warn("не удалось разобрать идентификатор поста MAX", "type", update.Type, "err", err)
+
+					return errInvalidUpdate
+				}
+				mid = number.String()
+			}
 		}
 		if mid == "" {
 			slog.Warn("MAX прислал пост без идентификатора", "chat_id", id)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -137,7 +138,7 @@ func TestRestartPreservesQueueAndDoesNotRepublishAnUncertainDestination(t *testi
 	if p, err := reopened.next(ctx, dst, time.Now()); err != nil || p.row != 0 {
 		t.Fatalf("an unresolved destination can still echo: %+v, %v", p, err)
 	}
-	if err := reopened.resolveUncertain(ctx, src.String(), key, dst.String(), []string{"mid.echo"}); err != nil {
+	if err := reopened.resolveDelivery(ctx, src.String(), key, dst.String(), []string{"mid.echo"}); err != nil {
 		t.Fatal(err)
 	}
 	if p, err := reopened.next(ctx, dst, time.Now()); err != nil || p.row == 0 || len(p.payloads) != 0 {
@@ -148,12 +149,261 @@ func TestRestartPreservesQueueAndDoesNotRepublishAnUncertainDestination(t *testi
 func TestPublishDoesNotRetryAnUnknownOutcome(t *testing.T) {
 	unknown := errors.New("response lost")
 	attempts := 0
-	_, err := retryPublish(context.Background(), func() ([]string, error) {
+	_, err := retryPublish(t.Context(), func() ([]string, error) {
 		attempts++
 
 		return nil, unknown
 	})
 	if !errors.Is(err, unknown) || attempts != 1 {
 		t.Fatalf("attempts=%d, err=%v", attempts, err)
+	}
+}
+
+func TestInterruptedMultipartDeliveryResumesAfterRestart(t *testing.T) {
+	for _, first := range [][]string{{"one"}, {"photo", "video"}} {
+		t.Run(strings.Join(first, "-"), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			path := filepath.Join(t.TempDir(), "queue.sqlite")
+			db, err := openStore(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { db.close() })
+			src, dst := channelKey{maxPlatform, -42}, channelKey{telegramPlatform, -100}
+			book := &deliveryBook{store: db, source: src, post: "message:original"}
+			var sent []string
+			parts := [][]string{first, {"tail"}}
+			send := func(ctx context.Context, stop bool) func(publish) error {
+				return func(publish publish) error {
+					for i, ids := range parts {
+						kinds := make([]mirrorKind, len(ids))
+						for j := range kinds {
+							kinds[j] = mirrorText
+						}
+						if err := publish(ctx, func() ([]string, error) {
+							sent = append(sent, ids...)
+							if stop && i == 0 {
+								cancel()
+							}
+							return ids, nil
+						}, kinds...); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+			}
+			if err := book.deliver(ctx, dst, send(ctx, true)); !errors.Is(err, context.Canceled) {
+				t.Fatalf("interrupted delivery: %v", err)
+			}
+			db.close()
+			db, err = openStore(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			book = &deliveryBook{store: db, source: src, post: "message:original"}
+			if err := book.deliver(t.Context(), dst, send(t.Context(), false)); err != nil {
+				t.Fatal(err)
+			}
+			if want := append(slices.Clone(first), "tail"); !slices.Equal(sent, want) {
+				t.Fatalf("published %v, want each part once: %v", sent, want)
+			}
+			var state string
+			if err := db.QueryRowContext(t.Context(), `SELECT state FROM deliveries WHERE source = ? AND post = ? AND destination = ?`, src.String(), book.post, dst.String()).Scan(&state); err != nil || state != "done" {
+				t.Fatalf("final state %q: %v", state, err)
+			}
+		})
+	}
+}
+
+func TestCanceledPublicationKeepsUnknownOutcomeBlocked(t *testing.T) {
+	db := testStore(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	src, dst := channelKey{telegramPlatform, -100}, channelKey{maxPlatform, -42}
+	book := &deliveryBook{store: db, source: src, post: "message:8"}
+	err := book.deliver(ctx, dst, func(publish publish) error {
+		return publish(ctx, func() ([]string, error) {
+			cancel() // the request may already have reached the platform
+			return nil, context.Canceled
+		}, mirrorText)
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation not preserved: %v", err)
+	}
+	var state string
+	if err := db.QueryRowContext(t.Context(), `SELECT state FROM deliveries`).Scan(&state); err != nil || state != "uncertain" {
+		t.Fatalf("unknown publication must remain uncertain: %q, %v", state, err)
+	}
+	if err := book.deliver(t.Context(), dst, func(publish) error {
+		t.Fatal("unknown outcome must never be retried")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanceledRejectedPublicationCanResume(t *testing.T) {
+	db := testStore(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	src, dst := channelKey{telegramPlatform, -100}, channelKey{maxPlatform, -42}
+	book := &deliveryBook{store: db, source: src, post: "message:8"}
+	err := book.deliver(ctx, dst, func(publish publish) error {
+		return publish(ctx, func() ([]string, error) {
+			cancel() // cancellation while pacing or waiting after an explicit 429
+			return nil, &publishError{message: "cancelled before publication"}
+		}, mirrorText)
+	})
+	if !errors.Is(err, errRejected) {
+		t.Fatalf("expected known rejection: %v", err)
+	}
+	sent := false
+	if err := book.deliver(t.Context(), dst, func(publish publish) error {
+		return publish(t.Context(), func() ([]string, error) {
+			sent = true
+			return []string{"one"}, nil
+		}, mirrorText)
+	}); err != nil || !sent {
+		t.Fatalf("known non-publication must resume: sent=%t, err=%v", sent, err)
+	}
+}
+
+func TestResumeRejectsChangedPublicationPlan(t *testing.T) {
+	for _, change := range []struct {
+		name string
+		plan []plannedMessage
+	}{
+		{"text", []plannedMessage{{Text: "changed"}}},
+		{"media", []plannedMessage{{Text: "original", Media: []plannedMedia{{"other", "image"}}}}},
+		{"boundaries", []plannedMessage{{Text: "orig"}, {Text: "inal"}}},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			db := testStore(t)
+			dst := channelKey{maxPlatform, -42}
+			book := &deliveryBook{store: db, source: channelKey{telegramPlatform, -100}, post: "message:8"}
+			if err := book.checkPlan(t.Context(), dst, []plannedMessage{{Text: "original"}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := book.set(t.Context(), dst, "partial", []string{"one"}, mirrorText); err != nil {
+				t.Fatal(err)
+			}
+			if err := book.checkPlan(t.Context(), dst, change.plan); err == nil {
+				t.Fatal("a different plan must not reuse the saved prefix")
+			}
+			if err := book.deliver(t.Context(), dst, func(publish) error {
+				t.Fatal("changed plan must not publish")
+				return nil
+			}); err == nil {
+				t.Fatal("plan failure must stop the worker before acknowledging the post")
+			}
+			var state string
+			if err := db.QueryRowContext(t.Context(), `SELECT state FROM deliveries`).Scan(&state); err != nil || state != "partial" {
+				t.Fatalf("saved prefix lost: %q, %v", state, err)
+			}
+		})
+	}
+}
+
+func TestLegacyPartialWithoutPlanIsNotResumedBlindly(t *testing.T) {
+	db := testStore(t)
+	dst := channelKey{maxPlatform, -42}
+	book := &deliveryBook{store: db, source: channelKey{telegramPlatform, -100}, post: "message:8"}
+	if err := book.set(t.Context(), dst, "partial", []string{"one"}, mirrorText); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.checkPlan(t.Context(), dst, []plannedMessage{{Text: "original"}}); err == nil {
+		t.Fatal("legacy partial has no evidence that the plan is still the same")
+	}
+}
+
+func TestUnpublishedDeliveryCanUpdateItsPlan(t *testing.T) {
+	for _, state := range []string{"", "partial"} {
+		t.Run("state="+state, func(t *testing.T) {
+			db := testStore(t)
+			dst := channelKey{maxPlatform, -42}
+			book := &deliveryBook{store: db, source: channelKey{telegramPlatform, -100}, post: "message:8"}
+			if err := book.checkPlan(t.Context(), dst, []plannedMessage{{Text: "fallback"}}); err != nil {
+				t.Fatal(err)
+			}
+			if state != "" {
+				if err := book.set(t.Context(), dst, state, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := book.checkPlan(t.Context(), dst, []plannedMessage{{Text: "original", Media: []plannedMedia{{"photo", "image"}}}}); err != nil {
+				t.Fatalf("a plan with no published parts can safely change: %v", err)
+			}
+		})
+	}
+}
+
+func TestResumeDoesNotSplitAnAlreadyPublishedGroup(t *testing.T) {
+	db := testStore(t)
+	dst := channelKey{telegramPlatform, -100}
+	book := &deliveryBook{store: db, source: channelKey{maxPlatform, -42}, post: "message:8"}
+	if err := book.set(t.Context(), dst, "partial", []string{"photo"}, mirrorCaption); err != nil {
+		t.Fatal(err)
+	}
+	err := book.deliver(t.Context(), dst, func(publish publish) error {
+		return publish(t.Context(), func() ([]string, error) {
+			t.Fatal("a changed group boundary must not duplicate the published photo")
+			return nil, nil
+		}, mirrorCaption, mirrorMedia)
+	})
+	if err == nil || book.err == nil {
+		t.Fatalf("changed group must stop processing: %v, %v", err, book.err)
+	}
+}
+
+func TestManualResolutionPreservesKnownCopiesAndRecordsManualIDs(t *testing.T) {
+	for _, state := range []string{"partial", "uncertain"} {
+		t.Run(state, func(t *testing.T) {
+			db := testStore(t)
+			src, dst := channelKey{telegramPlatform, -100}, channelKey{maxPlatform, -42}
+			book := &deliveryBook{store: db, source: src, post: "message:8"}
+			if err := book.set(t.Context(), dst, state, []string{"known"}, mirrorCaption); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.resolveDelivery(t.Context(), src.String(), book.post, dst.String(), []string{"known", "manual"}); err != nil {
+				t.Fatal(err)
+			}
+			var id string
+			var kind mirrorKind
+			if err := db.QueryRowContext(t.Context(), `SELECT mid, kind FROM mirrors`).Scan(&id, &kind); err != nil || id != "known" || kind != mirrorCaption {
+				t.Fatalf("known mirror changed: %q, %q, %v", id, kind, err)
+			}
+			var count int
+			if err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM published WHERE channel = ? AND mid IN ('known', 'manual')`, dst.String()).Scan(&count); err != nil || count != 2 {
+				t.Fatalf("echo identities missing: %d, %v", count, err)
+			}
+			if err := book.deliver(t.Context(), dst, func(publish) error {
+				t.Fatal("manually resolved delivery must not be replayed")
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestManualResolutionRefusesFinishedDelivery(t *testing.T) {
+	db := testStore(t)
+	src, dst := channelKey{telegramPlatform, -100}, channelKey{maxPlatform, -42}
+	book := &deliveryBook{store: db, source: src, post: "message:8"}
+	if err := book.set(t.Context(), dst, "done", []string{"known"}, mirrorText); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.resolveDelivery(t.Context(), src.String(), book.post, dst.String(), []string{"manual"}); err == nil {
+		t.Fatal("finished delivery cannot be resolved again")
+	}
+	var state string
+	if err := db.QueryRowContext(t.Context(), `SELECT state FROM deliveries`).Scan(&state); err != nil || state != "done" {
+		t.Fatalf("finished delivery changed: %q, %v", state, err)
+	}
+	var count int
+	if err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM published WHERE mid = 'manual'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected resolution wrote an identity: %d, %v", count, err)
 	}
 }

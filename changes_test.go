@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -104,6 +105,41 @@ func seedMirrors(t *testing.T, db *store, source, destination channelKey, root s
 	book := &deliveryBook{store: db, source: source, post: root}
 	if err := book.set(t.Context(), destination, "done", ids, kinds...); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInterruptedRevisionAppendsOnlyItsMissingTail(t *testing.T) {
+	db := testStore(t)
+	src, dst := channelKey{telegramPlatform, -100}, channelKey{maxPlatform, -42}
+	seedMirrors(t, db, src, dst, "message:8", []string{"original"}, mirrorText)
+	book := &deliveryBook{store: db, source: src, post: "change:8", root: "message:8"}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var appended []string
+	syncText := func(ctx context.Context, stop bool) error {
+		return syncMirrorText(ctx, book, dst, func(bool) (string, []string) {
+			return "", []string{"first", "second", "third"}
+		}, func(mirrorPart, string) error { return nil }, func(mirrorPart) error {
+			t.Error("no part should be removed")
+			return nil
+		}, func(text string, publish publish) error {
+			return publish(ctx, func() ([]string, error) {
+				appended = append(appended, text)
+				if stop {
+					cancel()
+				}
+				return []string{text}, nil
+			}, mirrorText)
+		})
+	}
+	if err := syncText(ctx, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("revision was not interrupted between parts: %v", err)
+	}
+	if err := syncText(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(appended, []string{"second", "third"}) {
+		t.Fatalf("revision appended %v", appended)
 	}
 }
 
@@ -261,7 +297,7 @@ func TestMaxWebhookEditsCaptionAndDeletesOnlyEnabledMirrors(t *testing.T) {
 }
 
 func TestTelegramWebhookRegistrationKeepsPendingUpdatesAndRefusesAnotherURL(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	address := "https://example.test/perepost/telegram"
 	var oldURL string
 	var configured map[string]string

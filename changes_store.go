@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -98,13 +100,27 @@ func (s *store) keepAlbum(ctx context.Context, source channelKey, post string, p
 	return tx.Commit()
 }
 
-func (s *store) reviseAlbum(ctx context.Context, source channelKey, event change) ([][]byte, error) {
-	if _, err := s.ExecContext(ctx, `UPDATE album_parts SET payload = ? WHERE source = ? AND post = ? AND mid = ?`,
-		[]byte(event.Message), source.String(), event.Group, event.Mid); err != nil {
-		return nil, err
+// splitLateAlbum gives new parts their own delivery identities once any
+// destination has attempted the original album. Existing parts stay frozen so
+// a resumed partial delivery keeps the same publication order.
+func (s *store) splitLateAlbum(ctx context.Context, source channelKey, p pendingPost) (bool, error) {
+	result, err := s.ExecContext(ctx, `
+		UPDATE inbox SET post = post || '#' || mid
+		WHERE source = ? AND post = ? AND rowid <= ? AND payload IS NOT NULL
+		AND EXISTS (SELECT 1 FROM deliveries WHERE source = inbox.source AND post = inbox.post)
+		AND NOT EXISTS (SELECT 1 FROM album_parts WHERE source = inbox.source AND post = inbox.post AND mid = inbox.mid)
+	`, source.String(), p.key, p.row)
+	if err != nil {
+		return false, err
 	}
+	n, err := result.RowsAffected()
+
+	return n > 0, err
+}
+
+func (s *store) albumPayloads(ctx context.Context, source channelKey, post string) ([][]byte, error) {
 	rows, err := s.QueryContext(ctx, `SELECT payload FROM album_parts WHERE source = ? AND post = ? ORDER BY CAST(mid AS INTEGER)`,
-		source.String(), event.Group)
+		source.String(), post)
 	if err != nil {
 		return nil, err
 	}
@@ -119,4 +135,24 @@ func (s *store) reviseAlbum(ctx context.Context, source channelKey, event change
 	}
 
 	return payloads, rows.Err()
+}
+
+func (s *store) reviseAlbum(ctx context.Context, source channelKey, event change) (string, [][]byte, error) {
+	var root string
+	err := s.QueryRowContext(ctx, `
+		SELECT post FROM album_parts WHERE source = ? AND mid = ? AND post IN (?, ?)
+	`, source.String(), event.Mid, event.Group, event.Group+"#"+event.Mid).Scan(&root)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := s.ExecContext(ctx, `UPDATE album_parts SET payload = ? WHERE source = ? AND post = ? AND mid = ?`,
+		[]byte(event.Message), source.String(), root, event.Mid); err != nil {
+		return root, nil, err
+	}
+	payloads, err := s.albumPayloads(ctx, source, root)
+
+	return root, payloads, err
 }

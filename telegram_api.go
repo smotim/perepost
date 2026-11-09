@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-telegram/bot/models"
@@ -217,7 +218,7 @@ func telegramWebhook(secret string, db *store, sources map[int64]*source) http.H
 	})
 }
 
-func (t telegramAPI) poll(ctx context.Context, db *store, sources map[int64]*source, events []string) error {
+func (t telegramAPI) poll(ctx context.Context, db *store, sources map[int64]*source, events []string, lastPoll *atomic.Int64) error {
 	var offset int64
 	for ctx.Err() == nil {
 		var updates []telegramUpdate
@@ -240,6 +241,7 @@ func (t telegramAPI) poll(ctx context.Context, db *store, sources map[int64]*sou
 
 			continue
 		}
+		lastPoll.Store(time.Now().UnixNano())
 		if len(updates) == 0 {
 			// The last request already acknowledged the previous batch.
 			// After a week of inactivity Telegram may pick a new random ID.

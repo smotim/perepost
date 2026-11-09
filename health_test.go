@@ -12,7 +12,10 @@ import (
 )
 
 func newMonitor(f *fake) *monitor {
-	return &monitor{relay: f.relay, sources: []*source{f.source}, to: f.source.to}
+	m := &monitor{relay: f.relay, sources: []*source{f.source}, to: f.source.to}
+	m.lastPoll.Store(time.Now().UnixNano())
+
+	return m
 }
 
 func TestMonitorPingsAndReportsOnlyStateChanges(t *testing.T) {
@@ -27,7 +30,7 @@ func TestMonitorPingsAndReportsOnlyStateChanges(t *testing.T) {
 	t.Cleanup(heartbeat.Close)
 	m := newMonitor(f)
 	m.heartbeat, m.client = heartbeat.URL, heartbeat.Client()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	m.check(ctx)
 	if pings.Load() != 1 || len(f.alerted()) != 0 {
@@ -52,10 +55,62 @@ func TestMonitorPingsAndReportsOnlyStateChanges(t *testing.T) {
 func TestMonitorNoticesRemovedTelegramAdmin(t *testing.T) {
 	f := fakes(t)
 	f.tgAdmin.Store(false)
-	newMonitor(f).check(context.Background())
+	newMonitor(f).check(t.Context())
 
 	if alerts := f.alerted(); len(alerts) != 1 || !strings.Contains(alerts[0], "не администратор канала Telegram «Канал»") {
 		t.Fatalf("alerts %q", alerts)
+	}
+}
+
+func TestPollingMonitorNoticesForeignWebhook(t *testing.T) {
+	f := fakes(t)
+	address := "https://other.example.test/webhook/secret"
+	f.tgWebhook.Store(&address)
+	m := newMonitor(f)
+	m.check(t.Context())
+
+	alerts := f.alerted()
+	if !m.failing || len(alerts) != 1 || !strings.Contains(alerts[0], "настроен вебхук") {
+		t.Fatalf("foreign webhook not reported: failing=%t, alerts=%q", m.failing, alerts)
+	}
+	if strings.Contains(alerts[0], "/webhook/secret") {
+		t.Fatalf("webhook secret leaked: %q", alerts)
+	}
+}
+
+func TestPollingMonitorStopsHeartbeatUntilPollingRecovers(t *testing.T) {
+	f := fakes(t)
+	var pings atomic.Int32
+	heartbeat := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		pings.Add(1)
+	}))
+	t.Cleanup(heartbeat.Close)
+	m := newMonitor(f)
+	m.heartbeat, m.client = heartbeat.URL, heartbeat.Client()
+	m.lastPoll.Store(time.Now().Add(-2*healthInterval - time.Second).UnixNano())
+	m.check(t.Context())
+	m.check(t.Context())
+	if alerts := f.alerted(); pings.Load() != 0 || len(alerts) != 1 || !strings.Contains(alerts[0], "приём постов Telegram не отвечает") {
+		t.Fatalf("stalled poller: pings=%d, alerts=%q", pings.Load(), alerts)
+	}
+
+	m.lastPoll.Store(time.Now().UnixNano())
+	m.check(t.Context())
+	if alerts := f.alerted(); pings.Load() != 1 || len(alerts) != 2 || !strings.Contains(alerts[1], "снова проходит") {
+		t.Fatalf("recovered poller: pings=%d, alerts=%q", pings.Load(), alerts)
+	}
+}
+
+func TestWebhookMonitorDoesNotRequirePolling(t *testing.T) {
+	f := fakes(t)
+	address := "https://our.example.test/webhook"
+	f.tgWebhook.Store(&address)
+	m := newMonitor(f)
+	m.tgWebhookURL = address
+	m.lastPoll.Store(0)
+	m.check(t.Context())
+	if m.failing || len(f.alerted()) != 0 {
+		t.Fatalf("webhook mode needs no polling: failing=%t, alerts=%q", m.failing, f.alerted())
 	}
 }
 
@@ -79,7 +134,7 @@ func TestChecksRunInParallelWithOwnTimeouts(t *testing.T) {
 		}
 	}
 
-	problems := runChecks(context.Background(), checks, 4, 100*time.Millisecond)
+	problems := runChecks(t.Context(), checks, 4, 100*time.Millisecond)
 	want := []string{"check 0", "check 5", "check 10", "check 15"}
 	if len(problems) != len(want) {
 		t.Fatalf("problems %q", problems)

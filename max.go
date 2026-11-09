@@ -25,8 +25,9 @@ import (
 
 // attachment is a file already uploaded to MAX.
 type attachment struct {
-	kind  model.AttachmentType
-	token string
+	kind     model.AttachmentType
+	token    string
+	sourceID string // stable source file ID, never the temporary upload token
 }
 
 func isNumber(s string) bool {
@@ -108,6 +109,7 @@ func dialPublicMedia(ctx context.Context, network, address string) (net.Conn, er
 		return nil, err
 	}
 	dialer := net.Dialer{Timeout: 4 * time.Second}
+	var dialErr error
 	for _, ip := range ips {
 		ip = ip.Unmap()
 		if !ip.IsGlobalUnicast() || ip.IsPrivate() || sharedIPv4.Contains(ip) {
@@ -117,9 +119,13 @@ func dialPublicMedia(ctx context.Context, network, address string) (net.Conn, er
 		if err == nil {
 			return conn, nil
 		}
+		dialErr = err
+	}
+	if dialErr != nil {
+		return nil, fmt.Errorf("не удалось подключиться к публичному адресу вложения MAX: %w", dialErr)
 	}
 
-	return nil, errors.New("не удалось подключиться к публичному адресу вложения MAX")
+	return nil, errors.New("у вложения MAX нет публичного адреса")
 }
 
 func newMaxClient(token string) (*maxClient, error) {

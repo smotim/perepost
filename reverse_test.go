@@ -17,7 +17,47 @@ import (
 	"time"
 
 	"github.com/go-telegram/bot/models"
+	"github.com/max-messenger/max-bot-api-client-go/v2/model"
 )
+
+func TestMaxTextOnlyAttachmentsDoNotWaitForMediaSlot(t *testing.T) {
+	for _, kind := range []model.AttachmentType{"", model.AttachShare, model.AttachSticker} {
+		t.Run(string(kind), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			db := testStore(t)
+			src := &maxSource{channel: maxChat{id: -42}, to: []*models.ChatFullInfo{{ID: -100}}}
+			message := maxMessage{Body: maxMessageBody{Mid: "original", Text: "text"}, URL: "https://max.ru/channel/post"}
+			if kind != "" {
+				message.Body.Attachments = []maxMedia{{Attachment: model.Attachment{Type: kind}}}
+			}
+			var sent int
+			r := &relay{mediaSlot: make(chan struct{}, 1), tgAPI: telegramAPI{
+				baseURL: "https://telegram.example", token: "token", http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					defer func() { _ = req.Body.Close() }()
+					var body struct {
+						Text string `json:"text"`
+					}
+					if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+						return nil, err
+					}
+					if !strings.HasPrefix(body.Text, "text") {
+						t.Errorf("message text lost: %q", body.Text)
+					}
+					sent++
+
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":11}}`)), Header: make(http.Header), Request: req}, nil
+				})},
+			}}
+			r.mediaSlot <- struct{}{}
+			book := &deliveryBook{store: db, source: channelKey{maxPlatform, -42}, post: "message:original"}
+			r.forwardMax(ctx, src, message, book)
+			if sent != 1 || book.err != nil || len(r.mediaSlot) != 1 {
+				t.Fatalf("text waited for another post's media: sent=%d, err=%v, occupied=%d", sent, book.err, len(r.mediaSlot))
+			}
+		})
+	}
+}
 
 func TestMaxWebhookPersistsAndRelaysAlbumOnce(t *testing.T) {
 	ctx := t.Context()
@@ -164,7 +204,8 @@ func TestTelegramAcknowledgesOnlyAfterPersisting(t *testing.T) {
 	}))
 	defer server.Close()
 	api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
-	if err := api.poll(ctx, db, map[int64]*source{-100: {}}, []string{"channel_post"}); err != nil {
+	var lastPoll atomic.Int64
+	if err := api.poll(ctx, db, map[int64]*source{-100: {}}, []string{"channel_post"}, &lastPoll); err != nil {
 		t.Fatal(err)
 	}
 }

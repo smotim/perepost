@@ -57,6 +57,23 @@ type uploads struct {
 	failed bool
 }
 
+type plannedMedia struct {
+	ID   string
+	Kind string
+}
+
+type plannedMessage struct {
+	Text     string
+	Entities []models.MessageEntity
+	Media    []plannedMedia
+	Quiet    bool
+}
+
+type maxPostPart struct {
+	text        string
+	attachments []attachment
+}
+
 func (u *uploads) add(a attachment) {
 	if a.kind == model.AttachFile || a.kind == model.AttachAudio {
 		u.files = append(u.files, a)
@@ -69,6 +86,17 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 	msgs := slices.SortedFunc(slices.Values(p.messages), func(a, b *models.Message) int { return a.ID - b.ID })
 	ref := src.postRef(msgs[0].ID)
 	log := slog.With("channel", src.channel.Title, "post", msgs[0].ID)
+	needed := make([]bool, len(src.to))
+	for i, dst := range src.to {
+		var err error
+		needed[i], err = book.needsDelivery(ctx, channelKey{maxPlatform, dst.id})
+		if err != nil {
+			return
+		}
+	}
+	if !slices.Contains(needed, true) {
+		return
+	}
 
 	var (
 		files    []media
@@ -113,6 +141,9 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 				return
 			}
 			for i, dst := range src.to {
+				if !needed[i] {
+					continue
+				}
 				a, err := r.upload(ctx, md, file)
 				if err != nil {
 					log.Error("вложение не загружено в MAX", "file", md.name, "to", dst.title, "err", err)
@@ -127,14 +158,33 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 	}
 
 	for i, dst := range src.to {
+		if !needed[i] {
+			continue
+		}
 		body := text.clone()
 		// A private channel's link would not open for MAX readers
 		if (lost || uploaded[i].failed) && src.channel.Username != "" {
 			body.append(linkText("Открыть пост в Telegram", ref))
 		}
+		parts := body.split(maxTextLimit)
+		var plan []plannedMessage
+		for _, msg := range maxPostMessages(parts, uploaded[i]) {
+			part := plannedMessage{Text: msg.text}
+			for _, a := range msg.attachments {
+				part.Media = append(part.Media, plannedMedia{a.sourceID, string(a.kind)})
+			}
+			plan = append(plan, part)
+		}
+		if err := book.checkPlan(ctx, channelKey{maxPlatform, dst.id}, struct {
+			Messages []plannedMessage
+			Preview  bool
+		}{plan, preview}); err != nil {
+			log.Error("продолжение публикации остановлено", "to", dst.title, "err", err)
+			return
+		}
 		var n int
 		err := book.deliver(ctx, channelKey{maxPlatform, dst.id}, func(publish publish) (err error) {
-			n, err = r.send(ctx, dst, body.split(maxTextLimit), uploaded[i], preview, publish)
+			n, err = r.send(ctx, dst, parts, uploaded[i], preview, publish)
 
 			return err
 		})
@@ -149,8 +199,8 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 		}
 	}
 
-	if len(problems) > 0 {
-		_ = r.alert(fmt.Sprintf("пост %s перенесён с ошибками:\n— %s", ref, strings.Join(problems, "\n— ")))
+	if len(problems) > 0 && ctx.Err() == nil {
+		_ = r.alert(ctx, fmt.Sprintf("пост %s перенесён с ошибками:\n— %s", ref, strings.Join(problems, "\n— ")))
 	}
 }
 
@@ -158,31 +208,31 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 // text first, then the rest of the text, then the files one per message.
 // MAX channels notify subscribers for every part. It returns how many
 // messages went out.
-func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads, preview bool, publish publish) (int, error) {
+func maxPostMessages(parts []string, u uploads) []maxPostPart {
 	first, files := u.visual, u.files
 	if len(first) == 0 && len(files) > 0 {
 		first, files = files[:1], files[1:]
 	}
 	if len(parts) == 0 && len(first) == 0 {
-		return 0, nil
+		return nil
 	}
 
-	type message struct {
-		text        string
-		attachments []attachment
-	}
 	caption := ""
 	if len(parts) > 0 {
 		caption, parts = parts[0], parts[1:]
 	}
-	messages := []message{{caption, first}}
+	messages := []maxPostPart{{caption, first}}
 	for _, part := range parts {
-		messages = append(messages, message{text: part})
+		messages = append(messages, maxPostPart{text: part})
 	}
 	for _, f := range files {
-		messages = append(messages, message{attachments: []attachment{f}})
+		messages = append(messages, maxPostPart{attachments: []attachment{f}})
 	}
+	return messages
+}
 
+func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads, preview bool, publish publish) (int, error) {
+	messages := maxPostMessages(parts, u)
 	for i, msg := range messages {
 		kind := mirrorText
 		if len(msg.attachments) > 0 {
@@ -230,11 +280,14 @@ func (r *relay) upload(ctx context.Context, md media, file tgFile) (attachment, 
 		return err
 	})
 
-	return attachment{kind: md.attach, token: token}, err
+	return attachment{kind: md.attach, token: token, sourceID: md.fileID}, err
 }
 
 // alert writes to the admin in Telegram when TELEGRAM_ADMIN_ID is set.
-func (r *relay) alert(text string) error {
+func (r *relay) alert(ctx context.Context, text string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if r.adminID == 0 {
 		return nil
 	}
@@ -242,7 +295,7 @@ func (r *relay) alert(text string) error {
 		text = string(runes[:3000]) + "…"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	ctx = withPacingChannel(ctx, strconv.FormatInt(r.adminID, 10))
 	_, err := r.tg.SendMessage(ctx, &bot.SendMessageParams{

@@ -1,8 +1,8 @@
 package main
 
 import (
+	"cmp"
 	"slices"
-	"sort"
 	"strings"
 	"unicode/utf16"
 
@@ -118,12 +118,12 @@ func (t richText) render(from, to int) string {
 		spans = append(spans, span{start, end, open, close})
 	}
 	// An outer entity opens before a nested one
-	sort.SliceStable(spans, func(a, b int) bool {
-		if spans[a].start != spans[b].start {
-			return spans[a].start < spans[b].start
+	slices.SortStableFunc(spans, func(a, b span) int {
+		if a.start != b.start {
+			return cmp.Compare(a.start, b.start)
 		}
 
-		return spans[a].end > spans[b].end
+		return cmp.Compare(b.end, a.end)
 	})
 
 	var (

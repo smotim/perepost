@@ -81,8 +81,9 @@ func telegramMessages(payloads [][]byte) ([]*models.Message, error) {
 		var m models.Message
 		if err := json.Unmarshal(payload, &m); err != nil {
 			problems = append(problems, err)
-
-			continue
+			if _, partial := errors.AsType[*json.UnmarshalTypeError](err); !partial {
+				continue
+			}
 		}
 		messages = append(messages, &m)
 	}
@@ -123,14 +124,19 @@ func (r *relay) editFromTelegram(ctx context.Context, src *source, p pendingPost
 	}
 	payloads := [][]byte{event.Message}
 	if strings.HasPrefix(event.Group, "album:") {
-		payloads, book.err = book.store.reviseAlbum(ctx, book.source, event)
+		if _, err := telegramMessages(payloads); err != nil {
+			r.changeError(ctx, book, "", err)
+
+			return
+		}
+		book.root, payloads, book.err = book.store.reviseAlbum(ctx, book.source, event)
 		if book.err != nil {
 			return
 		}
 	}
 	messages, err := telegramMessages(payloads)
 	if err != nil {
-		r.changeError(book, "", err)
+		r.changeError(ctx, book, "", err)
 
 		return
 	}
@@ -162,7 +168,7 @@ func (r *relay) editFromTelegram(ctx context.Context, src *source, p pendingPost
 				return retryPublish(ctx, func() ([]string, error) { return r.max.send(ctx, dst.id, part, nil, preview) })
 			}, mirrorText)
 		})
-		r.changeError(book, dst.title, err)
+		r.changeError(ctx, book, dst.title, err)
 	}
 }
 
@@ -175,7 +181,7 @@ func (r *relay) changeFromMax(ctx context.Context, src *maxSource, p pendingPost
 	if event.Kind == maxEdit {
 		var m maxMessage
 		if err := json.Unmarshal(event.Message, &m); err != nil {
-			r.changeError(book, "", err)
+			r.changeError(ctx, book, "", err)
 
 			return
 		}
@@ -217,16 +223,16 @@ func (r *relay) changeFromMax(ctx context.Context, src *maxSource, p pendingPost
 				return r.sendTelegram(ctx, dst.ID, part, nil, true, publish)
 			})
 		}
-		r.changeError(book, dst.Title, err)
+		r.changeError(ctx, book, dst.Title, err)
 	}
 }
 
-func (r *relay) changeError(book *deliveryBook, destination string, err error) {
-	if err == nil {
+func (r *relay) changeError(ctx context.Context, book *deliveryBook, destination string, err error) {
+	if err == nil || ctx.Err() != nil {
 		return
 	}
 	slog.Warn("не удалось синхронизировать пост", "source", book.source, "post", book.root, "to", destination, "err", err)
-	_ = r.alert(fmt.Sprintf("не удалось синхронизировать пост %s %s → «%s»: %v", book.source, book.root, destination, err))
+	_ = r.alert(ctx, fmt.Sprintf("не удалось синхронизировать пост %s %s → «%s»: %v", book.source, book.root, destination, err))
 }
 
 func syncMirrorText[T any](ctx context.Context, book *deliveryBook, dst channelKey, render func(bool) (T, []T),

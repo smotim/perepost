@@ -47,7 +47,8 @@ func main() {
 		version = strings.TrimPrefix(info.Main.Version, "v")
 	}
 	showVersion := flag.Bool("version", false, "print the version and exit")
-	resolve := flag.Bool("resolve-uncertain", false, "resolve an uncertain delivery: SOURCE POST DESTINATION none|ID [ID...]")
+	resolve := flag.Bool("resolve-delivery", false, "finish manual recovery of a partial or uncertain delivery: SOURCE POST DESTINATION none|ID [ID...]")
+	resolveUncertain := flag.Bool("resolve-uncertain", false, "alias for -resolve-delivery")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -57,7 +58,7 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()})))
 	start := run
-	if *resolve {
+	if *resolve || *resolveUncertain {
 		start = func() error { return resolveDelivery(flag.Args()) }
 	}
 	if err := start(); err != nil {
@@ -205,23 +206,7 @@ func run() error {
 		workers.Go(func() {
 			key := channelKey{telegramPlatform, src.channel.ID}
 			fail(process(sending, db, key, intakeDone, r.alert, func(p pendingPost, book *deliveryBook) {
-				if strings.HasPrefix(p.key, "change:") {
-					r.editFromTelegram(sending, src, p, book)
-
-					return
-				}
-				messages, err := telegramMessages(p.payloads)
-				if err != nil {
-					slog.Error("не удалось разобрать пост Telegram", "channel", key, "post", p.key, "err", err)
-				}
-				if len(messages) > 0 {
-					if strings.HasPrefix(p.key, "album:") {
-						if book.err = db.keepAlbum(sending, key, p.key, p.payloads); book.err != nil {
-							return
-						}
-					}
-					r.forward(sending, src, &post{messages}, book)
-				}
+				r.forwardTelegramPost(sending, src, p, book)
 			}))
 		})
 	}
@@ -229,28 +214,14 @@ func run() error {
 		workers.Go(func() {
 			key := channelKey{maxPlatform, src.channel.id}
 			fail(process(sending, db, key, intakeDone, r.alert, func(p pendingPost, book *deliveryBook) {
-				if strings.HasPrefix(p.key, "change:") {
-					r.changeFromMax(sending, src, p, book)
-
-					return
-				}
-				if len(p.payloads) == 0 {
-					return
-				}
-				var m maxMessage
-				if err := json.Unmarshal(p.payloads[0], &m); err != nil {
-					slog.Error("не удалось разобрать пост MAX", "channel", key, "post", p.key, "err", err)
-
-					return
-				}
-				r.forwardMax(sending, src, m, book)
+				r.forwardMaxPost(sending, src, p, book)
 			}))
 		})
 	}
 
 	summary := describe(list, maxList)
 	slog.Info("пересылаю посты", "routes", summary)
-	if err := r.alert(fmt.Sprintf("запущен, версия %s:\n%s", version, summary)); err != nil {
+	if err := r.alert(ctx, fmt.Sprintf("запущен, версия %s:\n%s", version, summary)); err != nil {
 		slog.Warn("написать на TELEGRAM_ADMIN_ID не получилось: откройте бота в Telegram и нажмите «Старт»")
 	}
 	health := &monitor{
@@ -258,16 +229,18 @@ func run() error {
 		client: &http.Client{Timeout: 30 * time.Second}, db: db, maxWebhookURL: cfg.maxWebhookURL,
 		tgWebhookURL: cfg.tgWebhookURL, tgEvents: tgEvents, maxEvents: maxEvents,
 	}
+	health.lastPoll.Store(time.Now().UnixNano())
 	var monitoring sync.WaitGroup
 	monitoring.Go(func() { health.run(ctx) })
 	if len(list) > 0 && cfg.tgWebhookURL == "" {
 		inputs.Go(func() {
-			if err := r.tgAPI.poll(ctx, db, channels.telegram, tgEvents); ctx.Err() == nil {
+			if err := r.tgAPI.poll(ctx, db, channels.telegram, tgEvents, &health.lastPoll); ctx.Err() == nil {
 				fail(err)
 			}
 		})
 	}
 	<-ctx.Done()
+	stop() // A second interrupt must stop the process even while it drains.
 
 	slog.Info("останавливаюсь, досылаю полученные посты")
 	done := make(chan struct{})
@@ -297,10 +270,71 @@ func run() error {
 	return failure
 }
 
+func (r *relay) forwardTelegramPost(ctx context.Context, src *source, p pendingPost, book *deliveryBook) {
+	if strings.HasPrefix(p.key, "change:") {
+		r.editFromTelegram(ctx, src, p, book)
+
+		return
+	}
+	if strings.HasPrefix(p.key, "album:") && len(p.payloads) > 0 {
+		if book.err = book.store.keepAlbum(ctx, book.source, p.key, p.payloads); book.err != nil {
+			return
+		}
+		// The first attempt freezes the album. A resumed delivery must use the
+		// same parts even if more updates arrived before the next process started.
+		p.payloads, book.err = book.store.albumPayloads(ctx, book.source, p.key)
+		if book.err != nil {
+			return
+		}
+	}
+	messages, err := telegramMessages(p.payloads)
+	if err != nil {
+		slog.Warn("пост Telegram разобран не полностью", "channel", book.source, "post", p.key, "err", err)
+		action := "переносим доступную часть"
+		if len(messages) == 0 {
+			action = "пост пропущен"
+		}
+		_ = r.alert(ctx, fmt.Sprintf("пост %s из %s разобран не полностью, %s: %v", p.key, book.source, action, err))
+	}
+	if len(messages) > 0 {
+		r.forward(ctx, src, &post{messages}, book)
+	}
+}
+
+func (r *relay) forwardMaxPost(ctx context.Context, src *maxSource, p pendingPost, book *deliveryBook) {
+	if strings.HasPrefix(p.key, "change:") {
+		r.changeFromMax(ctx, src, p, book)
+
+		return
+	}
+	if len(p.payloads) == 0 {
+		return
+	}
+	var m maxMessage
+	if err := json.Unmarshal(p.payloads[0], &m); err != nil {
+		slog.Warn("пост MAX разобран не полностью", "channel", book.source, "post", p.key, "err", err)
+		_, partial := errors.AsType[*json.UnmarshalTypeError](err)
+		action := "переносим доступные поля"
+		if !partial {
+			action = "пост пропущен"
+		}
+		_ = r.alert(ctx, fmt.Sprintf("пост %s из %s разобран не полностью, %s: %v", p.key, book.source, action, err))
+		if !partial {
+			return
+		}
+	}
+	r.forwardMax(ctx, src, m, book)
+}
+
 // process delivers the posts of one source in order. A crash while handling a
 // post stops the service, so the restart turns its in-flight publications into
 // uncertain ones; after maxPostFailures crashes in a row the post is skipped.
-func process(ctx context.Context, db *store, source channelKey, intakeDone <-chan struct{}, alert func(string) error, forward func(pendingPost, *deliveryBook)) error {
+func process(ctx context.Context, db *store, source channelKey, intakeDone <-chan struct{}, alert func(context.Context, string) error, forward func(pendingPost, *deliveryBook)) (err error) {
+	defer func() {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			err = nil
+		}
+	}()
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for ctx.Err() == nil {
@@ -309,25 +343,29 @@ func process(ctx context.Context, db *store, source channelKey, intakeDone <-cha
 		select {
 		case <-intakeDone:
 			draining = true
-			now = now.Add(albumWait)
 		default:
 		}
 		post, err := db.next(ctx, source, now)
 		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-
 			return err
 		}
 		if post.row != 0 {
+			if source.platform == telegramPlatform && strings.HasPrefix(post.key, "album:") {
+				moved, err := db.splitLateAlbum(ctx, source, post)
+				if err != nil {
+					return err
+				}
+				if moved {
+					continue
+				}
+			}
 			failures, err := db.failures(ctx, source, post.key)
 			if err != nil {
 				return err
 			}
 			if failures >= maxPostFailures {
 				slog.Error("пост пропущен после повторных сбоев", "channel", source, "post", post.key, "failures", failures)
-				_ = alert(fmt.Sprintf("пост %s из %s пропущен: обработка падала %d раза подряд", post.key, source, failures))
+				_ = alert(ctx, fmt.Sprintf("пост %s из %s пропущен: обработка падала %d раза подряд", post.key, source, failures))
 				if err := db.complete(ctx, source, post); err != nil {
 					return err
 				}
@@ -338,11 +376,11 @@ func process(ctx context.Context, db *store, source channelKey, intakeDone <-cha
 			if crash := handle(forward, post, book); crash != nil {
 				return crashed(ctx, db, source, post.key, crash, alert)
 			}
-			if ctx.Err() != nil {
-				break
-			}
 			if book.err != nil {
 				return book.err
+			}
+			if ctx.Err() != nil {
+				break
 			}
 			if err := db.complete(ctx, source, post); err != nil {
 				return err
@@ -383,7 +421,7 @@ func handle(forward func(pendingPost, *deliveryBook), p pendingPost, book *deliv
 }
 
 // crashed counts the crash, tells the admin and returns the error that stops the service.
-func crashed(ctx context.Context, db *store, source channelKey, post string, c *crash, alert func(string) error) error {
+func crashed(ctx context.Context, db *store, source channelKey, post string, c *crash, alert func(context.Context, string) error) error {
 	slog.Error("сбой при обработке поста", "channel", source, "post", post, "panic", c.value, "stack", string(c.stack))
 	// Shutdown may already be cancelling ctx; the count must still be saved.
 	saving, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -392,7 +430,7 @@ func crashed(ctx context.Context, db *store, source channelKey, post string, c *
 	if err != nil {
 		slog.Error("не удалось записать сбой поста", "channel", source, "post", post, "err", err)
 	}
-	_ = alert(fmt.Sprintf("сбой при обработке поста %s из %s (%d из %d, затем пост будет пропущен): %v",
+	_ = alert(ctx, fmt.Sprintf("сбой при обработке поста %s из %s (%d из %d, затем пост будет пропущен): %v",
 		post, source, count, maxPostFailures, c.value))
 
 	return fmt.Errorf("обработка поста %s из %s прервана: %v", post, source, c.value)
@@ -414,7 +452,7 @@ func resolveDelivery(args []string) error {
 		ids = nil
 	}
 
-	return db.resolveUncertain(ctx, args[0], args[1], args[2], ids)
+	return db.resolveDelivery(ctx, args[0], args[1], args[2], ids)
 }
 
 func prepareMediaDir(path string) error {

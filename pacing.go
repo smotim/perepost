@@ -27,6 +27,9 @@ type rateTransport struct {
 func (t *rateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	channel, _ := req.Context().Value(channelPacingKey{}).(string)
 	if err := t.wait(req.Context(), channel); err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
 		return nil, &publishError{message: err.Error()}
 	}
 	return t.next.RoundTrip(req)

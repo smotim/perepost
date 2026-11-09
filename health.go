@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,7 @@ type monitor struct {
 	heartbeat     string
 	client        *http.Client
 	failing       bool
+	lastPoll      atomic.Int64 // Unix nanoseconds; initialized at startup for the first poll's grace period
 }
 
 func (m *monitor) run(ctx context.Context) {
@@ -67,10 +69,19 @@ func (m *monitor) check(ctx context.Context) {
 			return m.relay.max.webhook(ctx, m.maxWebhookURL, "", m.maxEvents, false)
 		})
 	}
-	if len(m.sources) > 0 && m.tgWebhookURL != "" {
+	if len(m.sources) > 0 {
 		checks = append(checks, func(ctx context.Context) error {
 			return configureTelegramWebhook(ctx, m.relay.tg, m.tgWebhookURL, "", m.tgEvents, false)
 		})
+		if m.tgWebhookURL == "" {
+			checks = append(checks, func(context.Context) error {
+				if time.Since(time.Unix(0, m.lastPoll.Load())) > 2*healthInterval {
+					return fmt.Errorf("приём постов Telegram не отвечает дольше %s", 2*healthInterval)
+				}
+
+				return nil
+			})
+		}
 	}
 	seen := map[int64]bool{}
 	for _, src := range m.maxSources {
@@ -94,14 +105,14 @@ func (m *monitor) check(ctx context.Context) {
 	case len(problems) > 0:
 		slog.Error("проверка не прошла", "problems", problems)
 		if !m.failing {
-			_ = m.relay.alert("проверка не прошла, посты могут не пересылаться:\n— " + strings.Join(problems, "\n— "))
+			_ = m.relay.alert(ctx, "проверка не прошла, посты могут не пересылаться:\n— "+strings.Join(problems, "\n— "))
 		}
 		m.failing = true
 
 		return
 	case m.failing:
 		slog.Info("проверка снова проходит")
-		_ = m.relay.alert("проверка снова проходит, посты пересылаются")
+		_ = m.relay.alert(ctx, "проверка снова проходит, посты пересылаются")
 		m.failing = false
 	}
 

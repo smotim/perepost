@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +17,40 @@ import (
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type trackedRequestBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *trackedRequestBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestPacingClosesRequestBodyWhenCanceledBeforeSending(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	body := &trackedRequestBody{Reader: strings.NewReader("unsent body")}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.test", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := pacedTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("a canceled request reached the next transport")
+		return nil, errors.New("unexpected send")
+	}), time.Second)
+	resp, err := transport.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if !errors.Is(err, errRejected) {
+		t.Fatalf("cancellation must be a known non-publication: %v", err)
+	}
+	if !body.closed {
+		t.Fatal("the unsent request body was not closed")
+	}
+}
 
 func TestPacingSharesDestinationAcrossWorkersAndRespectsGlobalBudget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -46,7 +80,7 @@ func TestPacingSharesDestinationAcrossWorkersAndRespectsGlobalBudget(t *testing.
 			})
 		}
 		wg.Wait()
-		sort.Slice(all, func(i, j int) bool { return all[i].Before(all[j]) })
+		slices.SortFunc(all, time.Time.Compare)
 		if len(all) != 80 {
 			t.Fatalf("requests=%d", len(all))
 		}

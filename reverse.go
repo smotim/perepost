@@ -28,10 +28,11 @@ type maxSource struct {
 }
 
 type maxFile struct {
-	kind model.AttachmentType
-	path string
-	name string
-	size int64
+	kind     model.AttachmentType
+	path     string
+	name     string
+	size     int64
+	sourceID string
 }
 
 var maxEntityTypes = map[string]models.MessageEntityType{
@@ -128,6 +129,17 @@ func (t richText) telegramPart(from, limit int) (telegramText, int) {
 
 func (r *relay) forwardMax(ctx context.Context, src *maxSource, message maxMessage, book *deliveryBook) {
 	log := slog.With("channel", src.channel.title, "post", book.post)
+	needed := make([]bool, len(src.to))
+	for i, dst := range src.to {
+		var err error
+		needed[i], err = book.needsDelivery(ctx, channelKey{telegramPlatform, dst.ID})
+		if err != nil {
+			return
+		}
+	}
+	if !slices.Contains(needed, true) {
+		return
+	}
 	body := message.Body
 	text := maxPostText(message)
 	lost := false
@@ -136,7 +148,9 @@ func (r *relay) forwardMax(ctx context.Context, src *maxSource, message maxMessa
 		// A forwarded post can have no text or attachments of its own.
 		body.Attachments = append(body.Attachments, message.Link.Message.Attachments...)
 	}
-	if len(body.Attachments) > 0 {
+	if slices.ContainsFunc(body.Attachments, func(a maxMedia) bool {
+		return a.Type == model.AttachImage || a.Type == model.AttachVideo || a.Type == model.AttachAudio || a.Type == model.AttachFile
+	}) {
 		select {
 		case r.mediaSlot <- struct{}{}:
 			defer func() { <-r.mediaSlot }()
@@ -189,12 +203,28 @@ func (r *relay) forwardMax(ctx context.Context, src *maxSource, message maxMessa
 			continue
 		}
 		files = append(files, file)
+		files[len(files)-1].sourceID = fmt.Sprintf("%s:%d", body.Mid, i)
 		remaining -= file.size
 	}
 	if lost && webLink(message.URL) {
 		text.append(linkText("Открыть пост в MAX", message.URL))
 	}
-	for _, dst := range src.to {
+	for i, dst := range src.to {
+		if !needed[i] {
+			continue
+		}
+		var plan []plannedMessage
+		for _, msg := range telegramPostMessages(text, files) {
+			part := plannedMessage{Text: msg.text.text, Entities: msg.text.entities, Quiet: msg.quiet}
+			for _, file := range msg.files {
+				part.Media = append(part.Media, plannedMedia{file.sourceID, string(file.kind)})
+			}
+			plan = append(plan, part)
+		}
+		if err := book.checkPlan(ctx, channelKey{telegramPlatform, dst.ID}, plan); err != nil {
+			log.Error("продолжение публикации остановлено", "to", dst.Title, "err", err)
+			return
+		}
 		err := book.deliver(ctx, channelKey{telegramPlatform, dst.ID}, func(publish publish) error {
 			err := r.sendTelegramPost(ctx, dst.ID, text, files, publish)
 			if err == nil && (len(files) > 0 || len(text.units) > 0) {
@@ -208,12 +238,12 @@ func (r *relay) forwardMax(ctx context.Context, src *maxSource, message maxMessa
 			problems = append(problems, fmt.Sprintf("«%s»: %v", dst.Title, err))
 		}
 	}
-	if len(problems) > 0 {
+	if len(problems) > 0 && ctx.Err() == nil {
 		ref := message.URL
 		if !webLink(ref) {
 			ref = fmt.Sprintf("«%s», %s", src.channel.title, book.post)
 		}
-		_ = r.alert(fmt.Sprintf("пост %s перенесён с ошибками:\n— %s", ref, strings.Join(problems, "\n— ")))
+		_ = r.alert(ctx, fmt.Sprintf("пост %s перенесён с ошибками:\n— %s", ref, strings.Join(problems, "\n— ")))
 	}
 }
 
@@ -311,7 +341,7 @@ func (r *relay) fetchMaxFile(ctx context.Context, a maxMedia, address string, li
 		return maxFile{}, withoutPath(errors.Join(err, closeErr))
 	}
 
-	downloaded := maxFile{kind, file.Name(), cmp.Or(name, "file"), size}
+	downloaded := maxFile{kind: kind, path: file.Name(), name: cmp.Or(name, "file"), size: size}
 	prepared, err := downloaded.forTelegram()
 	if err != nil {
 		_ = os.Remove(file.Name())
@@ -321,7 +351,14 @@ func (r *relay) fetchMaxFile(ctx context.Context, a maxMedia, address string, li
 
 func visual(f maxFile) bool { return f.kind == model.AttachImage || f.kind == model.AttachVideo }
 
-func (r *relay) sendTelegramPost(ctx context.Context, chatID int64, text richText, files []maxFile, publish publish) error {
+type telegramPostPart struct {
+	text  telegramText
+	files []maxFile
+	quiet bool
+}
+
+func telegramPostMessages(text richText, files []maxFile) []telegramPostPart {
+	var messages []telegramPostPart
 	from, sent := 0, false
 	for len(files) > 0 {
 		n := 1
@@ -334,22 +371,27 @@ func (r *relay) sendTelegramPost(ctx context.Context, chatID int64, text richTex
 		if !sent {
 			caption, from = text.telegramPart(from, 1024)
 		}
-		if err := r.sendTelegram(ctx, chatID, caption, files[:n], sent, publish); err != nil {
-			return err
-		}
+		messages = append(messages, telegramPostPart{caption, files[:n], sent})
 		sent, files = true, files[n:]
 	}
 	for from < len(text.units) {
 		part, next := text.telegramPart(from, 4096)
 		if part.text != "" {
-			if err := r.sendTelegram(ctx, chatID, part, nil, sent, publish); err != nil {
-				return err
-			}
+			messages = append(messages, telegramPostPart{part, nil, sent})
 			sent = true
 		}
 		from = next
 	}
 
+	return messages
+}
+
+func (r *relay) sendTelegramPost(ctx context.Context, chatID int64, text richText, files []maxFile, publish publish) error {
+	for _, msg := range telegramPostMessages(text, files) {
+		if err := r.sendTelegram(ctx, chatID, msg.text, msg.files, msg.quiet, publish); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

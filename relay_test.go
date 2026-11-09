@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -41,11 +42,13 @@ type sent struct {
 // fake is a fake Telegram and MAX with a relay and a source wired to them:
 // posts of channel -100 go to MAX channel -42.
 type fake struct {
+	ctx    context.Context
 	relay  *relay
 	source *source
 
 	tgAdmin, maxAdmin, maxRejects atomic.Bool
 	uploads                       atomic.Int32
+	tgWebhook                     atomic.Pointer[string]
 
 	mu     sync.Mutex
 	sent   []sent
@@ -67,18 +70,24 @@ func (f *fake) alerted() []string {
 }
 
 func (f *fake) forward(msgs ...*models.Message) {
-	f.relay.forward(context.Background(), f.source, &post{messages: msgs}, nil)
+	f.relay.forward(f.ctx, f.source, &post{messages: msgs}, nil)
 }
 
 func fakes(t *testing.T) *fake {
 	t.Helper()
-	f := &fake{}
+	f := &fake{ctx: t.Context()}
 	f.tgAdmin.Store(true)
 	f.maxAdmin.Store(true)
 
 	tgServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseMultipartForm(1 << 20)
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/getWebhookInfo"):
+			address := ""
+			if webhook := f.tgWebhook.Load(); webhook != nil {
+				address = *webhook
+			}
+			fmt.Fprintf(w, `{"ok":true,"result":{"url":%q}}`, address)
 		case strings.HasSuffix(r.URL.Path, "/getFile"):
 			// A local Bot API server answers with an absolute path on the shared volume
 			path := "files/" + r.FormValue("file_id")
@@ -174,6 +183,65 @@ func fakes(t *testing.T) *fake {
 	}
 
 	return f
+}
+
+func TestCancelledForwardAndChangesDoNotAlertAdmin(t *testing.T) {
+	f := fakes(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	f.relay.forward(ctx, f.source, &post{messages: []*models.Message{{ID: 9, Text: "post"}}}, nil)
+	f.relay.changeError(ctx, &deliveryBook{source: channelKey{telegramPlatform, -100}, root: "message:9"}, "MAX", context.Canceled)
+	if err := f.relay.alert(ctx, "cancelled"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("alert did not preserve cancellation: %v", err)
+	}
+	if alerts := f.alerted(); len(alerts) != 0 {
+		t.Fatalf("shutdown sent false alerts: %v", alerts)
+	}
+}
+
+func TestAlertStopsWithItsParentContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started := make(chan struct{})
+	tg, err := bot.New("123:secret", bot.WithSkipGetMe(), bot.WithHTTPClient(time.Minute, &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			close(started)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &relay{tg: tg, adminID: 777}
+	done := make(chan error, 1)
+	go func() { done <- r.alert(ctx, "test") }()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("alert did not stop on cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("alert outlived its parent context")
+	}
+}
+
+func TestFinishedDeliveryDoesNotDownloadMediaAgain(t *testing.T) {
+	db := testStore(t)
+	book := &deliveryBook{store: db, source: channelKey{telegramPlatform, -100}, post: "album:a"}
+	dst := channelKey{maxPlatform, -42}
+	if err := book.set(t.Context(), dst, "done", nil); err != nil {
+		t.Fatal(err)
+	}
+	// No clients are configured: reaching the media code would panic.
+	r := &relay{}
+	r.forward(t.Context(), &source{channel: &models.ChatFullInfo{ID: -100}, to: []maxChat{{id: dst.id}}},
+		&post{messages: []*models.Message{{ID: 1, Photo: []models.PhotoSize{{FileID: "photo"}}}}}, book)
+	if book.err != nil {
+		t.Fatal(book.err)
+	}
 }
 
 func TestAlbumGoesAsOneMessageWithCaption(t *testing.T) {

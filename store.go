@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -82,6 +84,13 @@ func openStore(ctx context.Context, path string) (*store, error) {
 		);
 		CREATE INDEX IF NOT EXISTS deliveries_blocked ON deliveries(destination)
 			WHERE state IN ('sending', 'uncertain');
+		CREATE TABLE IF NOT EXISTS delivery_plans (
+			source TEXT NOT NULL,
+			post TEXT NOT NULL,
+			destination TEXT NOT NULL,
+			fingerprint TEXT NOT NULL,
+			PRIMARY KEY (source, post, destination)
+		);
 		CREATE TABLE IF NOT EXISTS published (
 			channel TEXT NOT NULL,
 			mid TEXT NOT NULL,
@@ -117,7 +126,6 @@ func openStore(ctx context.Context, path string) (*store, error) {
 			PRIMARY KEY (source, post)
 		);
 		UPDATE deliveries SET state = 'uncertain' WHERE state = 'sending';
-		UPDATE deliveries SET state = 'failed' WHERE state = 'partial';
 	`)
 	if err != nil {
 		s.close()
@@ -244,33 +252,122 @@ type deliveryBook struct {
 
 type publish func(context.Context, func() ([]string, error), ...mirrorKind) error
 
-func (b *deliveryBook) deliver(ctx context.Context, dst channelKey, send func(publish) error) error {
+// Only an untouched destination or a confirmed prefix can be sent. In-flight
+// and unknown publications stay blocked: resuming them could create duplicates.
+func (b *deliveryBook) needsDelivery(ctx context.Context, dst channelKey) (bool, error) {
 	if b == nil {
-		return send(func(_ context.Context, fn func() ([]string, error), _ ...mirrorKind) error {
-			_, err := fn()
-
-			return err
-		})
+		return true, nil
 	}
 	if b.err != nil {
-		return b.err
+		return false, b.err
 	}
 	var state string
 	err := b.store.QueryRowContext(ctx, `
 		SELECT state FROM deliveries WHERE source = ? AND post = ? AND destination = ?
 	`, b.source.String(), b.post, dst.String()).Scan(&state)
 	if err == nil {
-		return nil // a prior process already attempted this destination
+		return state == "partial", nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		b.err = err
 
+		return false, err
+	}
+	return true, nil
+}
+
+// A retry can download a different set of attachments after a transient media
+// failure. Never apply a saved prefix to that changed plan: its offsets no longer
+// identify the same messages. Plans contain stable IDs, not upload tokens or URLs.
+func (b *deliveryBook) checkPlan(ctx context.Context, dst channelKey, plan any) error {
+	if b == nil {
+		return nil
+	}
+	if b.err != nil {
+		return b.err
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		b.err = err
 		return err
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(encoded))
+	var previous string
+	err = b.store.QueryRowContext(ctx, `SELECT fingerprint FROM delivery_plans WHERE source = ? AND post = ? AND destination = ?`,
+		b.source.String(), b.post, dst.String()).Scan(&previous)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		b.err = err
+		return err
+	}
+	if previous == fingerprint {
+		return nil
+	}
+	var state string
+	err = b.store.QueryRowContext(ctx, `SELECT state FROM deliveries WHERE source = ? AND post = ? AND destination = ?`,
+		b.source.String(), b.post, dst.String()).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	var published int
+	if err == nil {
+		err = b.store.QueryRowContext(ctx, `SELECT count(*) FROM mirrors WHERE source = ? AND post = ? AND destination = ?`,
+			b.source.String(), b.post, dst.String()).Scan(&published)
+	}
+	if err == nil && (published > 0 || state == "sending" || state == "uncertain") {
+		if previous == "" {
+			err = errors.New("у незавершённой публикации нет сохранённого плана: проверьте опубликованные части перед продолжением")
+		} else {
+			err = errors.New("состав частей поста изменился: продолжение публикации остановлено")
+		}
+		err = fmt.Errorf("source=%s post=%s destination=%s: %w", b.source, b.post, dst, err)
+	}
+	if err == nil {
+		// No publication took place: a cancellation before the first request
+		// must not freeze a degraded media plan forever.
+		_, err = b.store.ExecContext(ctx, `
+			INSERT INTO delivery_plans(source, post, destination, fingerprint) VALUES (?, ?, ?, ?)
+			ON CONFLICT (source, post, destination) DO UPDATE SET fingerprint = excluded.fingerprint
+		`, b.source.String(), b.post, dst.String(), fingerprint)
+	}
+	b.err = err
+	return err
+}
+
+func (b *deliveryBook) deliver(ctx context.Context, dst channelKey, send func(publish) error) error {
+	if b == nil {
+		return send(func(_ context.Context, fn func() ([]string, error), _ ...mirrorKind) error {
+			_, err := fn()
+			return err
+		})
+	}
+	needed, err := b.needsDelivery(ctx, dst)
+	if err != nil || !needed {
+		return err
+	}
+	// A Telegram media group produces several mirrors in one publish call.
+	// Revisions store their mirrors under root and already select the missing
+	// suffix in syncMirrorText, so only count mirrors belonging to this post.
+	var remaining int
+	if b.err = b.store.QueryRowContext(ctx, `SELECT count(*) FROM mirrors WHERE source = ? AND post = ? AND destination = ?`,
+		b.source.String(), b.post, dst.String()).Scan(&remaining); b.err != nil {
+		return b.err
+	}
+	state := ""
+	if remaining > 0 {
+		state = "partial"
 	}
 
 	sendErr := send(func(ctx context.Context, fn func() ([]string, error), kinds ...mirrorKind) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if remaining > 0 {
+			if len(kinds) == 0 || remaining < len(kinds) {
+				b.err = errors.New("состав частей поста изменился: продолжение публикации остановлено")
+				return b.err
+			}
+			remaining -= len(kinds)
+			return nil
 		}
 		if b.err = b.set(ctx, dst, "sending", nil); b.err != nil {
 			return b.err
@@ -282,7 +379,9 @@ func (b *deliveryBook) deliver(ctx context.Context, dst channelKey, send func(pu
 			err = errors.New("платформа не вернула id опубликованных сообщений")
 			state = "uncertain"
 		case errors.Is(err, errRejected):
-			state = "failed"
+			if ctx.Err() == nil {
+				state = "failed"
+			}
 		case err != nil:
 			state = "uncertain"
 		}
@@ -297,8 +396,12 @@ func (b *deliveryBook) deliver(ctx context.Context, dst channelKey, send func(pu
 
 		return err
 	})
-	if b.err != nil || state == "uncertain" || state == "failed" || (state == "" && ctx.Err() != nil) {
+	if b.err != nil || state == "uncertain" || state == "failed" || ctx.Err() != nil {
 		return sendErr
+	}
+	if remaining > 0 {
+		b.err = errors.New("в восстановленном посте меньше частей, чем уже опубликовано")
+		return b.err
 	}
 	state = "done"
 	if sendErr != nil {
@@ -331,7 +434,10 @@ func (s *store) unresolved(ctx context.Context) error {
 	return rows.Err()
 }
 
-func (s *store) resolveUncertain(ctx context.Context, source, post, destination string, ids []string) error {
+// The operator has inspected the destination and completed or intentionally
+// stopped this delivery. Keep known mirrors and register any additional IDs so
+// their echoes are suppressed when normal queue processing resumes.
+func (s *store) resolveDelivery(ctx context.Context, source, post, destination string, ids []string) error {
 	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -339,13 +445,13 @@ func (s *store) resolveUncertain(ctx context.Context, source, post, destination 
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE deliveries SET state = 'failed'
-		WHERE source = ? AND post = ? AND destination = ? AND state = 'uncertain'
+		WHERE source = ? AND post = ? AND destination = ? AND state IN ('uncertain', 'partial')
 	`, source, post, destination)
 	if err != nil {
 		return err
 	}
 	if count, err := result.RowsAffected(); err != nil || count != 1 {
-		return errors.New("публикация со статусом uncertain не найдена")
+		return errors.New("публикация со статусом partial или uncertain не найдена")
 	}
 	for _, id := range ids {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO published(channel, mid) VALUES (?, ?) ON CONFLICT DO NOTHING`, destination, id); err != nil {
