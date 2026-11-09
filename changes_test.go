@@ -17,6 +17,67 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
+func TestOldTelegramCopiesReplaceStaleContentsWhenDeletionIsForbidden(t *testing.T) {
+	for _, kind := range []mirrorKind{mirrorText, mirrorCaption, mirrorMedia} {
+		t.Run(string(kind), func(t *testing.T) {
+			var calls []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				method := strings.TrimPrefix(req.URL.Path, "/bottoken/")
+				calls = append(calls, method)
+				if method == "deleteMessage" {
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted for everyone"}`)
+					return
+				}
+				var payload map[string]json.RawMessage
+				if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+					t.Error(err)
+				}
+				field := "text"
+				if kind != mirrorText {
+					field = "caption"
+				}
+				if string(payload[field]) != `"Содержимое удалено."` {
+					t.Errorf("payload=%s", payload[field])
+				}
+				fmt.Fprint(w, `{"ok":true,"result":true}`)
+			}))
+			t.Cleanup(server.Close)
+			api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
+			if err := api.deleteMirror(t.Context(), -100, mirrorPart{id: "123", kind: kind}); err != nil {
+				t.Fatal(err)
+			}
+			edit := "editMessageText"
+			if kind != mirrorText {
+				edit = "editMessageCaption"
+			}
+			if !slices.Equal(calls, []string{"deleteMessage", edit}) {
+				t.Fatalf("calls=%v", calls)
+			}
+		})
+	}
+}
+
+func TestMissingTelegramCopyDoesNotCreateTombstone(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls++
+		if !strings.HasSuffix(req.URL.Path, "/deleteMessage") {
+			t.Error("unexpected edit")
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message to delete not found"}`)
+	}))
+	t.Cleanup(server.Close)
+	api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
+	if err := api.deleteMirror(t.Context(), -100, mirrorPart{id: "123", kind: mirrorText}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls %d", calls)
+	}
+}
+
 func submitHook(t *testing.T, hook http.Handler, header, secret, body string, want int) {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(body))
@@ -176,7 +237,7 @@ func TestMaxWebhookEditsCaptionAndDeletesOnlyEnabledMirrors(t *testing.T) {
 		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	}))
 	defer server.Close()
-	r := &relay{tgAPI: telegramAPI{server.URL, "token", server.Client()}}
+	r := &relay{tgAPI: telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}}
 	for _, payload := range []string{
 		`{"update_type":"message_edited","timestamp":10,"message":{"recipient":{"chat_type":"channel","chat_id":-42},"body":{"mid":"mid.source","text":"edited"}}}`,
 		`{"update_type":"message_removed","timestamp":11,"chat_id":-42,"message_id":"mid.source"}`,

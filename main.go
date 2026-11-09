@@ -88,6 +88,8 @@ func run() error {
 	}
 
 	var options []bot.Option
+	tgTransport := pacedTransport(http.DefaultTransport, time.Second)
+	options = append(options, bot.WithHTTPClient(time.Minute, &http.Client{Transport: tgTransport, Timeout: time.Minute}))
 	fileLimit := int64(tgDownloadLimit)
 	apiURL, maxFileLimit, maxPostLimit := "https://api.telegram.org", int64(50<<20), int64(200<<20)
 	if cfg.telegramAPI != "" {
@@ -121,7 +123,7 @@ func run() error {
 	}
 	r := &relay{
 		tg: tg, max: maxc, http: &http.Client{Timeout: 5 * time.Minute}, adminID: cfg.adminID, fileLimit: fileLimit,
-		tgAPI:        telegramAPI{apiURL, cfg.telegramToken, &http.Client{Timeout: 15 * time.Minute, CheckRedirect: noRedirect}},
+		tgAPI:        telegramAPI{baseURL: apiURL, token: cfg.telegramToken, http: &http.Client{Transport: tgTransport, Timeout: 15 * time.Minute, CheckRedirect: noRedirect}},
 		maxFileLimit: maxFileLimit, maxPostLimit: maxPostLimit, mediaSlot: make(chan struct{}, 1),
 	}
 	var server *http.Server
@@ -465,6 +467,7 @@ func connect(ctx context.Context, tg *bot.Bot, maxc *maxClient, routes []route) 
 	}
 	result := sources{telegram: map[int64]*source{}, max: map[int64]*maxSource{}}
 	canPost := map[int64]bool{}
+	canPostMax := map[int64]bool{}
 	for _, rt := range routes {
 		if rt.reverse {
 			var to []*models.ChatFullInfo
@@ -509,6 +512,12 @@ func connect(ctx context.Context, tg *bot.Bot, maxc *maxClient, routes []route) 
 			chat, err := getMax(ref)
 			if err != nil {
 				return sources{}, err
+			}
+			if !canPostMax[chat.id] {
+				if err := maxc.checkAdmin(ctx, chat); err != nil {
+					return sources{}, err
+				}
+				canPostMax[chat.id] = true
 			}
 			to = append(to, chat)
 		}

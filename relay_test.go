@@ -124,7 +124,7 @@ func fakes(t *testing.T) *fake {
 				fmt.Fprint(w, `{"token":"file-token"}`)
 			}
 		case strings.HasSuffix(r.URL.Path, "/members/me"):
-			fmt.Fprintf(w, `{"user_id":1,"is_admin":%t}`, f.maxAdmin.Load())
+			fmt.Fprintf(w, `{"user_id":1,"is_admin":%t,"permissions":["write"]}`, f.maxAdmin.Load())
 		case r.URL.Path == "/messages":
 			if f.maxRejects.Load() {
 				w.WriteHeader(http.StatusBadRequest)
@@ -332,7 +332,7 @@ func TestLocalBotAPIFileIsStreamedFromDiskAndRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.forward(&models.Message{ID: 12, Caption: "Запись", Video: &models.Video{FileID: path, FileSize: 300 << 20}})
+	f.forward(&models.Message{ID: 12, Caption: "Запись", Video: &models.Video{FileID: path, FileSize: 200 << 20}})
 
 	got := f.messages()
 	if len(got) != 1 || got[0].body.Text != "Запись" || len(got[0].body.Attachments) != 1 || got[0].body.Attachments[0].Type != "video" {

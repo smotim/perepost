@@ -32,6 +32,17 @@ func (t telegramAPI) call(ctx context.Context, method string, payload any, files
 	if err != nil {
 		return &publishError{message: err.Error()}
 	}
+	if method != "getUpdates" {
+		var destination struct {
+			ChatID json.RawMessage `json:"chat_id"`
+		}
+		if err := json.Unmarshal(data, &destination); err != nil {
+			return &publishError{message: err.Error()}
+		}
+		if len(destination.ChatID) > 0 {
+			ctx = withPacingChannel(ctx, string(destination.ChatID))
+		}
+	}
 	var body io.Reader = bytes.NewReader(data)
 	contentType, length := "application/json", int64(len(data))
 	if len(files) > 0 {

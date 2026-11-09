@@ -127,10 +127,11 @@ func newMaxClient(token string) (*maxClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	limited := pacedTransport(transport, 500*time.Millisecond)
 	client := &http.Client{
 		// The library default of 30 s is far too short for a video of up to 2 GB
 		Timeout:   30 * time.Minute,
-		Transport: retryableStatus{next: transport},
+		Transport: retryableStatus{next: limited},
 	}
 	api, err := maxbot.NewApi(token, maxbot.WithHTTPClient(client))
 	if err != nil {
@@ -139,7 +140,7 @@ func newMaxClient(token string) (*maxClient, error) {
 
 	return &maxClient{
 		api: api, http: client, token: token, baseURL: "https://" + maxbot.DefaultHostV2,
-		publish: &http.Client{Transport: transport, Timeout: 90 * time.Second, CheckRedirect: noRedirect},
+		publish: &http.Client{Transport: limited, Timeout: 90 * time.Second, CheckRedirect: noRedirect},
 	}, nil
 }
 
@@ -160,8 +161,8 @@ func (t retryableStatus) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// resolve finds a channel by link (https://max.ru/name), name or id and
-// checks that the bot may post there.
+// resolve finds a channel by link (https://max.ru/name), name or id.
+// The caller checks read or write permissions according to the route.
 func (m *maxClient) resolve(ctx context.Context, ref string) (maxChat, error) {
 	var (
 		chat model.Chat
@@ -185,7 +186,10 @@ func (m *maxClient) resolve(ctx context.Context, ref string) (maxChat, error) {
 
 	c := maxChat{id: chat.ChatID, title: chat.Title, kind: chat.Type}
 
-	return c, m.checkAdmin(ctx, c)
+	if c.kind != model.ChatTypeChannel {
+		return maxChat{}, fmt.Errorf("«%s» — не канал MAX", c.title)
+	}
+	return c, nil
 }
 
 // checkAdmin checks that the bot can still post to the channel.
@@ -196,6 +200,9 @@ func (m *maxClient) checkAdmin(ctx context.Context, chat maxChat) error {
 	}
 	if !member.IsAdmin && !member.IsOwner {
 		return fmt.Errorf("бот не администратор канала MAX «%s»: публиковать в канале могут только администраторы", chat.title)
+	}
+	if !member.IsOwner && !slices.Contains(member.Permissions, "write") && !slices.Contains(member.Permissions, "post_edit_delete_message") {
+		return fmt.Errorf("боту нужно право публикации write в канале MAX «%s»", chat.title)
 	}
 
 	return nil
@@ -252,6 +259,7 @@ func (m *maxClient) upload(ctx context.Context, kind model.UploadType, name stri
 // The SDK retries its POST even after a lost response. Use one HTTP request
 // here so that only confirmed rejections can be retried by the delivery book.
 func (m *maxClient) send(ctx context.Context, chatID int64, html string, attachments []attachment, preview bool) ([]string, error) {
+	ctx = withPacingChannel(ctx, strconv.FormatInt(chatID, 10))
 	msg := model.NewMessageBody{Text: html, Attachments: make([]model.Attachment, 0, len(attachments))}
 	if html != "" {
 		msg.Format = model.FormatHTML

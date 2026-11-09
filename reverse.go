@@ -42,11 +42,21 @@ var maxEntityTypes = map[string]models.MessageEntityType{
 	"monospaced":    models.MessageEntityTypeCode,
 	"quote":         models.MessageEntityTypeBlockquote,
 	"link":          models.MessageEntityTypeTextLink,
+	"heading":       models.MessageEntityTypeBold,
+	"highlighted":   models.MessageEntityTypeUnderline,
+	"user_mention":  models.MessageEntityTypeTextLink,
 }
 
 func (b maxMessageBody) richText() richText {
 	text := newRichText(b.Text, nil)
 	for _, span := range b.Markup {
+		if span.Type == "user_mention" {
+			span.URL = ""
+			username := strings.TrimPrefix(span.UserLink, "@")
+			if validMaxUsername.MatchString(username) {
+				span.URL = "https://max.ru/" + username
+			}
+		}
 		kind, ok := maxEntityTypes[span.Type]
 		if !ok || span.From < 0 || span.From >= len(text.units) || span.Length <= 0 || span.Length > len(text.units)-span.From {
 			continue
@@ -155,9 +165,6 @@ func (r *relay) forwardMax(ctx context.Context, src *maxSource, message maxMessa
 			continue
 		}
 		limit := min(r.maxFileLimit, remaining)
-		if a.Type == model.AttachImage {
-			limit = min(limit, 10<<20) // sendPhoto limit, including with a local server
-		}
 		file, err := r.downloadMax(ctx, a, limit)
 		if errors.Is(err, errMaxMediaExpired) && message.Body.Mid != "" && i < len(message.Body.Attachments) {
 			if !refreshTried {
@@ -304,7 +311,12 @@ func (r *relay) fetchMaxFile(ctx context.Context, a maxMedia, address string, li
 		return maxFile{}, withoutPath(errors.Join(err, closeErr))
 	}
 
-	return maxFile{kind, file.Name(), cmp.Or(name, "file"), size}, nil
+	downloaded := maxFile{kind, file.Name(), cmp.Or(name, "file"), size}
+	prepared, err := downloaded.forTelegram()
+	if err != nil {
+		_ = os.Remove(file.Name())
+	}
+	return prepared, err
 }
 
 func visual(f maxFile) bool { return f.kind == model.AttachImage || f.kind == model.AttachVideo }

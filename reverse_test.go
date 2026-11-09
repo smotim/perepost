@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,8 +25,18 @@ func TestMaxWebhookPersistsAndRelaysAlbumOnce(t *testing.T) {
 	src := &maxSource{channel: maxChat{id: -42, title: "MAX"}, to: []*models.ChatFullInfo{{ID: -100, Title: "Telegram"}}}
 	key := channelKey{maxPlatform, src.channel.id}
 	hook := maxWebhook("test-secret", db, map[int64]*maxSource{-42: src})
+	var pngBytes bytes.Buffer
+	if err := png.Encode(&pngBytes, image.NewGray(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	photo := pngBytes.Bytes()
+	video := []byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
 	cdn := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		_, _ = io.WriteString(w, req.URL.Path)
+		if req.URL.Path == "/image" {
+			_, _ = w.Write(photo)
+		} else {
+			_, _ = w.Write(video)
+		}
 	}))
 	defer cdn.Close()
 	payload := fmt.Sprintf(`{
@@ -61,7 +74,7 @@ func TestMaxWebhookPersistsAndRelaysAlbumOnce(t *testing.T) {
 			return
 		}
 		defer func() { _ = req.MultipartForm.RemoveAll() }()
-		for i, want := range []string{"/image", "/video"} {
+		for i, want := range [][]byte{photo, video} {
 			file, _, err := req.FormFile(fileField(i))
 			if err != nil {
 				t.Error(err)
@@ -70,7 +83,7 @@ func TestMaxWebhookPersistsAndRelaysAlbumOnce(t *testing.T) {
 			}
 			contents, err := io.ReadAll(file)
 			_ = file.Close()
-			if err != nil || string(contents) != want {
+			if err != nil || !bytes.Equal(contents, want) {
 				t.Errorf("file %d: %q, %v", i, contents, err)
 			}
 		}
@@ -89,7 +102,7 @@ func TestMaxWebhookPersistsAndRelaysAlbumOnce(t *testing.T) {
 	}))
 	defer telegram.Close()
 	dir := t.TempDir()
-	r := &relay{tgAPI: telegramAPI{telegram.URL, "token", telegram.Client()}, maxMediaHTTP: cdn.Client(),
+	r := &relay{tgAPI: telegramAPI{baseURL: telegram.URL, token: "token", http: telegram.Client()}, maxMediaHTTP: cdn.Client(),
 		mediaDir: dir, maxFileLimit: 1024, maxPostLimit: 2048, mediaSlot: make(chan struct{}, 1)}
 	var m maxMessage
 	if err := json.Unmarshal(post.payloads[0], &m); err != nil {
@@ -150,7 +163,7 @@ func TestTelegramAcknowledgesOnlyAfterPersisting(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	api := telegramAPI{server.URL, "token", server.Client()}
+	api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
 	if err := api.poll(ctx, db, map[int64]*source{-100: {}}, []string{"channel_post"}); err != nil {
 		t.Fatal(err)
 	}

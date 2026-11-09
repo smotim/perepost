@@ -154,9 +154,9 @@ func (r *relay) editFromTelegram(ctx context.Context, src *source, p pendingPost
 
 			return "", parts
 		}, func(part mirrorPart, value string) error {
-			return r.max.editText(ctx, part.id, value)
+			return r.max.editText(ctx, dst.id, part.id, value)
 		}, func(part mirrorPart) error {
-			return r.max.deleteMirror(ctx, part.id)
+			return r.max.deleteMirror(ctx, dst.id, part.id)
 		}, func(part string, publish publish) error {
 			return publish(ctx, func() ([]string, error) {
 				return retryPublish(ctx, func() ([]string, error) { return r.max.send(ctx, dst.id, part, nil, preview) })
@@ -189,7 +189,7 @@ func (r *relay) changeFromMax(ctx context.Context, src *maxSource, p pendingPost
 			return
 		}
 		key := channelKey{telegramPlatform, dst.ID}
-		remove := func(part mirrorPart) error { return r.tgAPI.deleteMirror(ctx, dst.ID, part.id) }
+		remove := func(part mirrorPart) error { return r.tgAPI.deleteMirror(ctx, dst.ID, part) }
 		var err error
 		switch {
 		case event.Kind == maxDelete && src.changes[dst.ID].deletes:
@@ -327,8 +327,8 @@ func (t telegramAPI) editText(ctx context.Context, chatID int64, part mirrorPart
 	})
 }
 
-func (t telegramAPI) deleteMirror(ctx context.Context, chatID int64, id string) error {
-	mid, err := strconv.Atoi(id)
+func (t telegramAPI) deleteMirror(ctx context.Context, chatID int64, part mirrorPart) error {
+	mid, err := strconv.Atoi(part.id)
 	if err != nil {
 		return err
 	}
@@ -338,6 +338,14 @@ func (t telegramAPI) deleteMirror(ctx context.Context, chatID int64, id string) 
 		if errors.Is(err, errRejected) && strings.Contains(err.Error(), "message to delete not found") {
 			return nil
 		}
+		if errors.Is(err, errRejected) && strings.Contains(err.Error(), "message can't be deleted") {
+			// Telegram cannot remove copies older than 48 hours. Its own
+			// channel posts can still be edited; remove their stale contents.
+			if part.kind == mirrorMedia {
+				part.kind = mirrorCaption
+			}
+			return t.editText(ctx, chatID, part, telegramText{text: "Содержимое удалено."})
+		}
 		if err == nil && !result {
 			return &publishError{message: "Telegram не подтвердил удаление"}
 		}
@@ -346,7 +354,7 @@ func (t telegramAPI) deleteMirror(ctx context.Context, chatID int64, id string) 
 	})
 }
 
-func (m *maxClient) editText(ctx context.Context, mid, text string) error {
+func (m *maxClient) editText(ctx context.Context, chatID int64, mid, text string) error {
 	payload, err := json.Marshal(struct {
 		Text   string           `json:"text"`
 		Format model.TextFormat `json:"format"`
@@ -354,14 +362,15 @@ func (m *maxClient) editText(ctx context.Context, mid, text string) error {
 	if err != nil {
 		return err
 	}
-	return retry(ctx, func() error { return m.mutateMessage(ctx, http.MethodPut, mid, payload) })
+	return retry(ctx, func() error { return m.mutateMessage(ctx, http.MethodPut, chatID, mid, payload) })
 }
 
-func (m *maxClient) deleteMirror(ctx context.Context, mid string) error {
-	return retry(ctx, func() error { return m.mutateMessage(ctx, http.MethodDelete, mid, nil) })
+func (m *maxClient) deleteMirror(ctx context.Context, chatID int64, mid string) error {
+	return retry(ctx, func() error { return m.mutateMessage(ctx, http.MethodDelete, chatID, mid, nil) })
 }
 
-func (m *maxClient) mutateMessage(ctx context.Context, method, mid string, payload []byte) error {
+func (m *maxClient) mutateMessage(ctx context.Context, method string, chatID int64, mid string, payload []byte) error {
+	ctx = withPacingChannel(ctx, strconv.FormatInt(chatID, 10))
 	query := url.Values{"message_id": {mid}}
 	req, err := http.NewRequestWithContext(ctx, method, m.baseURL+"/messages?"+query.Encode(), bytes.NewReader(payload))
 	if err != nil {

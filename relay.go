@@ -105,6 +105,13 @@ func (r *relay) forward(ctx context.Context, src *source, p *post, book *deliver
 		// A closure, so the file is removed even when an upload panics.
 		func() {
 			defer file.remove()
+			md, err = md.prepared(file)
+			if err != nil {
+				log.Warn("вложение не подходит для MAX", "file", md.name, "err", err)
+				problems = append(problems, fmt.Sprintf("%s: %v", md.name, err))
+				lost = true
+				return
+			}
 			for i, dst := range src.to {
 				a, err := r.upload(ctx, md, file)
 				if err != nil {
@@ -198,6 +205,9 @@ func (r *relay) send(ctx context.Context, dst maxChat, parts []string, u uploads
 }
 
 func (r *relay) download(ctx context.Context, md media) (tgFile, error) {
+	if err := md.validate(md.size); err != nil {
+		return tgFile{}, err
+	}
 	if r.fileLimit > 0 && md.size > r.fileLimit {
 		return tgFile{}, errTooBig
 	}
@@ -234,6 +244,7 @@ func (r *relay) alert(text string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	ctx = withPacingChannel(ctx, strconv.FormatInt(r.adminID, 10))
 	_, err := r.tg.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:             r.adminID,
 		Text:               "perepost: " + text,

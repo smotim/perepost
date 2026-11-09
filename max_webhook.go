@@ -48,10 +48,11 @@ type maxMedia struct {
 }
 
 type maxMarkup struct {
-	Type   string `json:"type"`
-	From   int    `json:"from"`
-	Length int    `json:"length"`
-	URL    string `json:"url"`
+	Type     string `json:"type"`
+	From     int    `json:"from"`
+	Length   int    `json:"length"`
+	URL      string `json:"url"`
+	UserLink string `json:"user_link"`
 }
 
 var errInvalidUpdate = errors.New("некорректное событие вебхука")

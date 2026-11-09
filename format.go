@@ -179,9 +179,49 @@ func (t richText) render(from, to int) string {
 // goes at a blank line, then at a line break, then at a space, and only as a
 // last resort in the middle of a word.
 func (t richText) split(limit int) []string {
+	t = t.clone()
+	// Preserve an address as visible text if its escaped href cannot fit
+	// even beside one character, or exceeds MAX's link length limit.
+	var kept []models.MessageEntity
+	var addresses []string
+	for _, e := range t.entities {
+		open, close, ok := t.tags(e)
+		if ok && (htmlLen(open+close)+5 > limit || (e.Type == models.MessageEntityTypeTextLink && htmlLen(e.URL) > 2048)) {
+			if e.Type == models.MessageEntityTypeTextLink && !slices.Contains(addresses, e.URL) {
+				addresses = append(addresses, e.URL)
+			}
+			continue
+		}
+		kept = append(kept, e)
+	}
+	t.entities = kept
+	for _, address := range addresses {
+		t.append(newRichText(address, nil))
+	}
 	var parts []string
 	end := trimRight(t.units, len(t.units))
 	for from := skipSpace(t.units, 0); from < end; {
+		first := from + 1
+		if t.units[from] >= 0xD800 && t.units[from] < 0xDC00 && first < end {
+			first++
+		}
+		if htmlLen(t.render(from, first)) > limit {
+			// Several nested entities may together exceed the budget.
+			// Drop only the entities active here, keeping their link targets.
+			kept = nil
+			for _, e := range t.entities {
+				if e.Offset <= from && e.Offset+e.Length > from {
+					if e.Type == models.MessageEntityTypeTextLink && !slices.Contains(addresses, e.URL) {
+						addresses = append(addresses, e.URL)
+						t.append(newRichText(e.URL, nil))
+					}
+					continue
+				}
+				kept = append(kept, e)
+			}
+			t.entities = kept
+			end = trimRight(t.units, len(t.units))
+		}
 		to := end
 		if htmlLen(t.render(from, to)) > limit {
 			to = t.cut(from, end, limit)
@@ -217,6 +257,9 @@ func (t richText) cut(from, end, limit int) int {
 	}
 
 	lo, hi := from+1, end
+	if t.units[from] >= 0xD800 && t.units[from] < 0xDC00 && lo < end {
+		lo++
+	}
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
 		if fits(mid) {
