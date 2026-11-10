@@ -79,6 +79,64 @@ func TestMissingTelegramCopyDoesNotCreateTombstone(t *testing.T) {
 	}
 }
 
+func TestEditingMissingTelegramCopyDoesNotRepublishOrAlert(t *testing.T) {
+	for _, kind := range []mirrorKind{mirrorText, mirrorCaption} {
+		t.Run(string(kind), func(t *testing.T) {
+			db := testStore(t)
+			src, dst := channelKey{maxPlatform, -42}, channelKey{telegramPlatform, -100}
+			seedMirrors(t, db, src, dst, "message:original", []string{"123"}, kind)
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				calls++
+				if !strings.Contains(req.URL.Path, "/editMessage") {
+					t.Errorf("unexpected request: %s", req.URL.Path)
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}`)
+			}))
+			t.Cleanup(server.Close)
+			api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
+			book := &deliveryBook{store: db, source: src, post: "change:edit", root: "message:original"}
+			// A longer revision must not recreate a removed copy as extra chunks.
+			for range 2 {
+				err := syncMirrorText(t.Context(), book, dst, func(bool) (telegramText, []telegramText) {
+					return telegramText{text: "caption"}, []telegramText{{text: "edited"}, {text: "extra"}}
+				}, func(part mirrorPart, text telegramText) error {
+					return api.editText(t.Context(), dst.id, part, text)
+				}, func(mirrorPart) error {
+					t.Error("must not delete other parts")
+					return nil
+				}, func(telegramText, publish) error {
+					t.Error("must not publish a replacement or a new tail")
+					return nil
+				})
+				if err != nil || book.err != nil {
+					t.Fatalf("missing copy should be skipped: %v, storage: %v", err, book.err)
+				}
+			}
+			if calls != 2 {
+				t.Fatalf("calls=%d, want one per revision", calls)
+			}
+			parts, err := book.mirrors(t.Context(), dst)
+			if err != nil || len(parts) != 1 || parts[0].id != "123" {
+				t.Fatalf("keep the known copy to prevent resurrection: %v, %v", parts, err)
+			}
+		})
+	}
+}
+
+func TestTelegramEditPermissionErrorIsNotMissingCopy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message can't be edited"}`)
+	}))
+	t.Cleanup(server.Close)
+	api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
+	if err := api.editText(t.Context(), -100, mirrorPart{id: "123", kind: mirrorText}, telegramText{text: "edit"}); err == nil {
+		t.Fatal("permission errors must remain visible")
+	}
+}
+
 func submitHook(t *testing.T, hook http.Handler, header, secret, body string, want int) {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(body))

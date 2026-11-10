@@ -20,6 +20,8 @@ import (
 
 type syncOptions struct{ edits, deletes bool }
 
+var errMirrorMissing = errors.New("копия сообщения отсутствует")
+
 func addSyncOptions(changes map[int64]syncOptions, id int64, route route) {
 	old := changes[id]
 	changes[id] = syncOptions{edits: old.edits || route.syncEdits, deletes: old.deletes || route.syncDeletes}
@@ -250,12 +252,21 @@ func syncMirrorText[T any](ctx context.Context, book *deliveryBook, dst channelK
 	caption, desired := render(captionAt >= 0)
 	if captionAt >= 0 {
 		if err := edit(parts[captionAt], caption); err != nil {
+			if errors.Is(err, errMirrorMissing) {
+				return nil
+			}
 			return err
 		}
 	}
 	existing := slices.DeleteFunc(parts, func(p mirrorPart) bool { return p.kind != mirrorText })
 	for i := range min(len(existing), len(desired)) {
 		if err := edit(existing[i], desired[i]); err != nil {
+			if errors.Is(err, errMirrorMissing) {
+				// Keep its position in the saved copy and skip this destination.
+				// Forgetting it or appending a longer revision would resurrect
+				// a post (or part) the channel's administrator removed.
+				return nil
+			}
 			return err
 		}
 	}
@@ -328,6 +339,10 @@ func (t telegramAPI) editText(ctx context.Context, chatID int64, part mirrorPart
 		if errors.Is(err, errRejected) && strings.Contains(err.Error(), "message is not modified") {
 			return nil
 		}
+		if errors.Is(err, errRejected) && strings.Contains(err.Error(), "message to edit not found") {
+			slog.Info("копия Telegram отсутствует, правка пропущена", "chat_id", chatID, "message_id", mid)
+			return fmt.Errorf("%w: %w", errMirrorMissing, err)
+		}
 
 		return err
 	})
@@ -350,7 +365,11 @@ func (t telegramAPI) deleteMirror(ctx context.Context, chatID int64, part mirror
 			if part.kind == mirrorMedia {
 				part.kind = mirrorCaption
 			}
-			return t.editText(ctx, chatID, part, telegramText{text: "Содержимое удалено."})
+			err := t.editText(ctx, chatID, part, telegramText{text: "Содержимое удалено."})
+			if errors.Is(err, errMirrorMissing) {
+				return nil
+			}
+			return err
 		}
 		if err == nil && !result {
 			return &publishError{message: "Telegram не подтвердил удаление"}
