@@ -1,6 +1,6 @@
 # The build runs on the host platform and cross-compiles: no emulation is
 # needed for the arm64 image.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
 ARG TARGETOS TARGETARCH VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
