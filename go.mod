@@ -5,7 +5,7 @@ go 1.27
 toolchain go1.27.4
 
 require (
-	github.com/go-telegram/bot v1.28.0
+	github.com/go-telegram/bot v1.30.0
 	github.com/max-messenger/max-bot-api-client-go/v2 v2.5.0
 	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/sys v0.50.0
