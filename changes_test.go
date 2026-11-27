@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	maxbot "github.com/max-messenger/max-bot-api-client-go/v2"
 )
 
 func TestOldTelegramCopiesReplaceStaleContentsWhenDeletionIsForbidden(t *testing.T) {
@@ -134,6 +135,73 @@ func TestTelegramEditPermissionErrorIsNotMissingCopy(t *testing.T) {
 	api := telegramAPI{baseURL: server.URL, token: "token", http: server.Client()}
 	if err := api.editText(t.Context(), -100, mirrorPart{id: "123", kind: mirrorText}, telegramText{text: "edit"}); err == nil {
 		t.Fatal("permission errors must remain visible")
+	}
+}
+
+func TestMaxMutationResult(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		method       string
+		body         string
+		lookupStatus int
+		lookupBody   string
+		missing      bool
+		reject       string
+	}{
+		{name: "edited", method: http.MethodPut, body: `{"success":true}`},
+		{name: "missing copy on edit", method: http.MethodPut,
+			body: `{"success":false,"code":"not.found","message":"Resource not found"}`, missing: true},
+		{name: "missing copy on delete", method: http.MethodDelete,
+			body: `{"success":false,"code":"not.found","message":"Resource not found"}`},
+		{name: "permission denied", method: http.MethodPut,
+			body: `{"success":false,"code":"chat.denied","message":"Access denied"}`, reject: "chat.denied: Access denied"},
+		{name: "legacy error", method: http.MethodPut,
+			body: `{"success":false,"message":"Invalid request"}`, reject: "Invalid request"},
+		{name: "ambiguous edit of deleted copy", method: http.MethodPut,
+			body:         `{"success":false,"code":"proto.payload","message":"Error on message edit"}`,
+			lookupStatus: http.StatusNotFound, lookupBody: `{"code":"not.found","message":"Message mid.copy not found"}`,
+			missing: true},
+		{name: "ambiguous edit of existing copy", method: http.MethodPut,
+			body:         `{"success":false,"code":"proto.payload","message":"Error on message edit"}`,
+			lookupStatus: http.StatusOK, lookupBody: `{"body":{"mid":"mid.copy"}}`,
+			reject: "proto.payload: Error on message edit"},
+		{name: "ambiguous edit when lookup is denied", method: http.MethodPut,
+			body:         `{"success":false,"code":"proto.payload","message":"Error on message edit"}`,
+			lookupStatus: http.StatusForbidden, lookupBody: `{"code":"chat.denied","message":"Access denied"}`,
+			reject: "Access denied"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method == http.MethodGet && req.URL.Path == "/messages/mid.copy" && tc.lookupStatus != 0 {
+					w.WriteHeader(tc.lookupStatus)
+					fmt.Fprint(w, tc.lookupBody)
+					return
+				}
+				if req.Method != tc.method || req.URL.Query().Get("message_id") != "mid.copy" {
+					t.Errorf("unexpected MAX request: %s %s", req.Method, req.URL)
+				}
+				fmt.Fprint(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			api, err := maxbot.NewApi("max-token", maxbot.WithBaseURL(server.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := maxClient{api: api, baseURL: server.URL, publish: server.Client()}
+			err = client.mutateMessage(t.Context(), tc.method, -42, "mid.copy", nil)
+			switch {
+			case tc.missing:
+				if !errors.Is(err, errMirrorMissing) {
+					t.Fatalf("expected missing copy, got %v", err)
+				}
+			case tc.reject != "":
+				if errors.Is(err, errMirrorMissing) || !errors.Is(err, errRejected) || !strings.Contains(err.Error(), tc.reject) {
+					t.Fatalf("expected rejection containing %q, got %v", tc.reject, err)
+				}
+			case err != nil:
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

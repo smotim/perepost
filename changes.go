@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-telegram/bot/models"
 	maxbot "github.com/max-messenger/max-bot-api-client-go/v2"
@@ -426,13 +427,44 @@ func (m *maxClient) mutateMessage(ctx context.Context, method string, chatID int
 
 		return errors.New(message)
 	}
-	var result model.SimpleQueryResult
+	var result struct {
+		model.SimpleQueryResult
+		Code string `json:"code"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return err
 	}
-	if !result.Success {
-		return &publishError{message: "MAX не подтвердил изменение"}
+	if result.Success {
+		return nil
 	}
 
-	return nil
+	message := "MAX не подтвердил изменение"
+	if result.Code != "" {
+		message += ": " + result.Code
+	}
+	if result.Message != "" {
+		message += ": " + result.Message
+	}
+	rejection := &publishError{message: message}
+	missing := result.Code == "not.found"
+	if method == http.MethodPut && result.Message == "Error on message edit" && (result.Code == "proto.payload" || result.Code == "") {
+		// MAX can return this generic edit error for a deleted message.
+		// Only skip the edit if reading the same message confirms it is missing.
+		lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		_, lookupErr := m.api.Messages.GetMessageByID(lookupCtx, mid)
+		failure, ok := errors.AsType[*maxbot.Error](lookupErr)
+		missing = ok && failure.Code == "not.found"
+		if lookupErr != nil && !missing {
+			return fmt.Errorf("%w (проверка копии MAX: %w)", rejection, lookupErr)
+		}
+	}
+	if !missing {
+		return rejection
+	}
+	if method == http.MethodDelete {
+		return nil
+	}
+	slog.Info("копия MAX отсутствует, правка пропущена", "chat_id", chatID, "message_id", mid)
+	return fmt.Errorf("%w: %w", errMirrorMissing, rejection)
 }
